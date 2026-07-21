@@ -1,0 +1,24 @@
+# Verified against the `dendroprop` conda env (Python 3.12.12), which is what the
+# reported results were produced with.
+#
+# ── GPU (what this project is actually run on) ────────────────────────────────
+# Do NOT install plain `jaxlib` for GPU — it is the CPU wheel and JAX will
+# silently fall back to the CPU backend. Install the CUDA 12 extra instead,
+# which pulls jax-cuda12-plugin + jax-cuda12-pjrt and the nvidia-* runtime libs:
+#
+#     pip install "jax[cuda12]==0.10.0"
+#
+# Verify you actually got the GPU:
+#     python -c "import jax; print(jax.default_backend(), jax.devices())"
+#     # expected: gpu [CudaDevice(id=0)]
+#
+# ── CPU-only ──────────────────────────────────────────────────────────────────
+#     pip install "jax[cpu]==0.10.0"
+#
+# See https://docs.jax.dev/en/latest/installation.html
+jax[cuda12]==0.10.0
+# jax==0.10.0
+flax==0.12.5         
+numpy==2.4.3
+h5py==3.14.0
+tensorflow==2.21.0

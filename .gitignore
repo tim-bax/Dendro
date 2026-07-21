@@ -1,0 +1,32 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Trained models and checkpoints (run_shd.py writes Original/models/*.npz)
+models/
+*.npz
+
+# Datasets. SHD is auto-downloaded to a cache dir at runtime, never in-tree.
+# See README "Data" for how the cache location is chosen.
+*.h5
+*.h5.gz
+data/cache/
+
+# Environments
+.venv/
+venv/
+env/
+.conda/
+
+# Tooling
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
