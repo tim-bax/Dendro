@@ -1,0 +1,3 @@
+# Dev/test-only dependencies (not needed to train or run the model).
+#   uv pip install -r requirements-dev.txt
+pytest==9.1.1

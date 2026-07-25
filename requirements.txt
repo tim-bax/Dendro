@@ -21,4 +21,5 @@ jax[cuda12]==0.10.0
 flax==0.12.5         
 numpy==2.4.3
 h5py==3.14.0
-tensorflow==2.21.0
+# TensorFlow was only used by the legacy SHD loader (data/shd.py, removed in
+# Commit 4). The unified dataset layer (dendroprop.data) is NumPy + h5py only.

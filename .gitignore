@@ -3,15 +3,20 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# Trained models and checkpoints (run_shd.py writes Original/models/*.npz)
+# Trained models / run artifacts (experiments/run_shd.py writes runs/<name>/model.npz)
 models/
+runs/
 *.npz
 
-# Datasets. SHD is auto-downloaded to a cache dir at runtime, never in-tree.
-# See README "Data" for how the cache location is chosen.
+# Datasets. SHD is auto-downloaded to a cache dir at runtime, never in-tree
+# (dendroprop.data caches to ~/.cache/dendroprop or $DENDRO_CACHE_DIR).
 *.h5
 *.h5.gz
-data/cache/
+
+# Golden .npz fixtures are committed on purpose (the refactor's frozen safety
+# net), overriding the *.npz rule above. Scoped to *.npz so it can't re-include
+# __pycache__/ or other ignored cruft under tests/golden/.
+!tests/golden/*.npz
 
 # Environments
 .venv/
@@ -30,3 +35,6 @@ env/
 .idea/
 .DS_Store
 *.swp
+
+# Context
+dendroprop_methods.pdf
