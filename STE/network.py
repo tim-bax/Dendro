@@ -31,9 +31,19 @@ _LOG_EPS = 1e-8
 #  accumulates two eligibility tensors of shape (N_l, N_{l-1}) during the
 #  forward scan; these are contracted AFTER the scan with a per-layer
 #  learning signal L_l = B_l^T · e, where e is the single end-of-sequence
-#  output error and B_l is a FIXED random feedback matrix (J, N_l). Because
-#  B_l is fixed and e is time-independent, L_l factors out of the time sum,
-#  so the accumulators never carry the output index J.
+#  output error and B_l is the layer's feedback matrix (J, N_l). Because B_l
+#  is time-independent and e is time-independent, L_l factors out of the time
+#  sum, so the accumulators never carry the output index J.
+#
+#  Feedback matrices (weight-transported symmetric / STE): B_l is built each
+#  step from the CURRENT forward weights as a reverse cumulative product,
+#      B_l = W_readout · Π_{k>l} (w_soma_k + c·w_dend_k),
+#  so the LAST hidden layer uses the live readout weights W_readout verbatim
+#  (exact ∂E/∂z, symmetric e-prop, Bellec et al. 2020, Eq. 4) and every deeper
+#  layer transports the error down through the two-compartment forward weights
+#  above it. The dendrite branch is collapsed to a single straight-through gain
+#  c (self.fb_dend_c, default gamma·0.5) instead of the exact per-timestep
+#  plateau sensitivity — hence "STE". No fixed random feedback is used.
 #
 #  weights pytree:  {"dend": [w_dend_0..], "soma": [w_soma_0..],
 #                    "readout": w_readout}
@@ -393,7 +403,7 @@ class Network:
         adam_eps: float = 1e-8,
         dropout_rate: float = 0.0,
         weight_decay: float = 0.0,
-        feedback_scale: float = 0.1,
+        fb_dend_c: float = None,
     ):
         self.n_inputs = n_inputs
         self.hidden_sizes = list(hidden_sizes)
@@ -402,25 +412,19 @@ class Network:
         self.optimizer = optimizer
         self.dropout_rate = dropout_rate
         self.weight_decay = weight_decay
-        self.feedback_scale = feedback_scale
+        # Straight-through gain on the dendrite route in the transported feedback.
+        self.fb_dend_c = config.gamma * 0.5 if fb_dend_c is None else fb_dend_c
         self.n_layers = len(self.hidden_sizes)
 
         # Chain of hidden two-compartment layers: dims [n_inputs, *hidden_sizes].
         dims = [n_inputs] + self.hidden_sizes
-        keys = random.split(key, self.n_layers + 3)
+        keys = random.split(key, self.n_layers + 2)
         self.hidden = [
             TwoCompNeuron(keys[l], self.hidden_sizes[l], dims[l], config)
             for l in range(self.n_layers)
         ]
         self.readout = LINeuron(keys[self.n_layers], n_outputs, self.hidden_sizes[-1], config)
         self.rng_key = keys[self.n_layers + 1]
-
-        # Fixed random feedback matrices B_l (J, N_l), sampled once.
-        fb_keys = random.split(keys[self.n_layers + 2], self.n_layers)
-        self.B = [
-            random.normal(fb_keys[l], (n_outputs, self.hidden_sizes[l])) * feedback_scale
-            for l in range(self.n_layers)
-        ]
 
         if optimizer == "adam":
             self.beta1 = beta1
@@ -466,6 +470,23 @@ class Network:
             flat.append(g_soma_list[l])
         flat.append(g_readout)
         return flat
+
+    def _feedback_list(self):
+        # Weight-transported symmetric feedback (STE). Each hidden layer receives
+        # the output error through the static chain
+        #     B_l = W_out · Π_{k>l} (W_soma_k + c·W_dend_k),
+        # a reverse cumulative product of the forward weights above it. The last
+        # hidden layer uses the live readout weights W_out verbatim; the dendrite
+        # route is collapsed to a single straight-through gain c = self.fb_dend_c.
+        # For L=1 this returns [W_out] (all-symmetric).
+        c = self.fb_dend_c
+        B = [None] * self.n_layers
+        B[self.n_layers - 1] = self.readout.w                  # (J, N_{L-1})
+        for l in range(self.n_layers - 2, -1, -1):
+            nxt = self.hidden[l + 1]
+            M = nxt.w_soma + c * nxt.w_dend                    # (N_{l+1}, N_l)
+            B[l] = B[l + 1] @ M                                # (J, N_l)
+        return B
 
     def _tp_list(self):
         return [h.T_p for h in self.hidden]
@@ -558,7 +579,7 @@ class Network:
         )
 
         loss, pred, g_r, g_s_list, g_d_list = _loss_single(
-            mean_v, sum_Er, C_soma, A_dend, self.B,
+            mean_v, sum_Er, C_soma, A_dend, self._feedback_list(),
             self._smooth_targets(target), T,
             self.config.loss_temperature, self.config.loss_count_bias,
         )
@@ -586,7 +607,7 @@ class Network:
         )
 
         losses, preds, g_r, g_s_list, g_d_list = _loss_batch(
-            mean_v, sum_Er, C_soma, A_dend, self.B,
+            mean_v, sum_Er, C_soma, A_dend, self._feedback_list(),
             self._smooth_targets(targets), T,
             self.config.loss_temperature, self.config.loss_count_bias,
         )
@@ -621,7 +642,7 @@ class Network:
                 "optimizer": self.optimizer,
                 "dropout_rate": float(self.dropout_rate),
                 "weight_decay": float(self.weight_decay),
-                "feedback_scale": float(self.feedback_scale),
+                "fb_dend_c": float(self.fb_dend_c),
             },
             "config": dataclasses.asdict(self.config),
             "extra": extra or {},
@@ -638,7 +659,6 @@ class Network:
             arrays[f"w_dend_{l}"] = np.asarray(h.w_dend)
             arrays[f"w_soma_{l}"] = np.asarray(h.w_soma)
             arrays[f"T_p_{l}"] = np.asarray(h.T_p)
-            arrays[f"B_{l}"] = np.asarray(self.B[l])
         # Shared scalar dynamics (identical across layers).
         h0 = self.hidden[0]
         arrays["alpha_d"] = np.asarray(h0.alpha_d)
@@ -673,7 +693,7 @@ class Network:
             adam_eps=build.get("adam_eps", 1e-8),
             dropout_rate=build["dropout_rate"],
             weight_decay=build["weight_decay"],
-            feedback_scale=build.get("feedback_scale", 0.1),
+            fb_dend_c=build.get("fb_dend_c", None),
         )
 
         def arr(k):
@@ -687,7 +707,6 @@ class Network:
             h.alpha_d = arr("alpha_d")
             h.alpha_s = arr("alpha_s")
             h.alpha_w = arr("alpha_w")
-            net.B[l] = arr(f"B_{l}")
         net.readout.alpha_m = arr("alpha_m")
 
         if build["optimizer"] == "adam" and "adam_step" in data.files:

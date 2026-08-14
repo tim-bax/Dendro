@@ -1,0 +1,538 @@
+<title>Where the Two Backward Passes Diverge</title>
+<style>
+  :root {
+    --paper:   #f5f6f8;
+    --panel:   #ffffff;
+    --panel-2: #eef0f4;
+    --ink:     #171a21;
+    --ink-2:   #4c5563;
+    --ink-3:   #7b8494;
+    --line:    #e0e3ea;
+    --line-2:  #cfd4de;
+    --soma:    #2563a8;   /* somatic backbone — kept by both rules */
+    --soma-bg: #e8f0fa;
+    --dend:    #b56d12;   /* dendrite edge — pruned inter-layer (#1) */
+    --dend-bg: #f8efdd;
+    --danger:  #b23524;   /* exploding through-time recurrence (#2) */
+    --danger-bg:#f8e6e2;
+    --scale:   #6a5ea0;   /* dropped rescalings (#3) */
+    --scale-bg:#eeebf6;
+    --serif: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", Georgia, "Times New Roman", serif;
+    --mono:  ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+    --measure: 70ch;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper:   #0e1116;
+      --panel:   #161a21;
+      --panel-2: #1d2129;
+      --ink:     #e7eaf0;
+      --ink-2:   #a7b0bd;
+      --ink-3:   #737d8c;
+      --line:    #262c35;
+      --line-2:  #333b46;
+      --soma:    #5ba1e6;
+      --soma-bg: #142130;
+      --dend:    #d8a24a;
+      --dend-bg: #2a2213;
+      --danger:  #e57a68;
+      --danger-bg:#2c1a16;
+      --scale:   #a99cd6;
+      --scale-bg:#201d2c;
+    }
+  }
+  :root[data-theme="light"] {
+    --paper:#f5f6f8; --panel:#ffffff; --panel-2:#eef0f4; --ink:#171a21; --ink-2:#4c5563;
+    --ink-3:#7b8494; --line:#e0e3ea; --line-2:#cfd4de; --soma:#2563a8; --soma-bg:#e8f0fa;
+    --dend:#b56d12; --dend-bg:#f8efdd; --danger:#b23524; --danger-bg:#f8e6e2;
+    --scale:#6a5ea0; --scale-bg:#eeebf6;
+  }
+  :root[data-theme="dark"] {
+    --paper:#0e1116; --panel:#161a21; --panel-2:#1d2129; --ink:#e7eaf0; --ink-2:#a7b0bd;
+    --ink-3:#737d8c; --line:#262c35; --line-2:#333b46; --soma:#5ba1e6; --soma-bg:#142130;
+    --dend:#d8a24a; --dend-bg:#2a2213; --danger:#e57a68; --danger-bg:#2c1a16;
+    --scale:#a99cd6; --scale-bg:#201d2c;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--paper); color: var(--ink);
+    font-family: var(--serif); font-size: 18px; line-height: 1.72;
+    -webkit-font-smoothing: antialiased;
+  }
+  .page { max-width: 1120px; margin: 0 auto; padding: clamp(1.2rem, 4vw, 3.5rem) clamp(1rem, 4vw, 2.5rem) 4rem; }
+
+  /* ---- typography ---- */
+  h1, h2, h3 { text-wrap: balance; line-height: 1.2; margin: 0; }
+  .eyebrow {
+    font-family: var(--mono); font-size: .72rem; letter-spacing: .16em;
+    text-transform: uppercase; color: var(--ink-3); margin: 0 0 .8rem;
+  }
+  h1 { font-size: clamp(2rem, 5vw, 3rem); font-weight: 700; letter-spacing: -.015em; }
+  .standfirst { font-size: clamp(1.1rem, 2.4vw, 1.32rem); color: var(--ink-2); max-width: 60ch; margin: 1.1rem 0 0; }
+  h2 { font-size: clamp(1.4rem, 3vw, 1.85rem); font-weight: 700; letter-spacing: -.01em; }
+  h3 { font-size: 1.16rem; font-weight: 700; margin-top: 2rem; }
+  section > p, section > ul, section > ol, .col { max-width: var(--measure); }
+  p { margin: 1rem 0; }
+  a { color: var(--soma); text-underline-offset: 3px; }
+  strong { font-weight: 700; }
+  .prose-num { font-variant-numeric: tabular-nums; }
+
+  /* ---- section frame ---- */
+  section { margin-top: clamp(2.6rem, 6vw, 4rem); }
+  .sec-head { display: flex; align-items: baseline; gap: .9rem; border-top: 1px solid var(--line-2); padding-top: 1.4rem; }
+  .sec-head .n { font-family: var(--mono); font-size: .95rem; color: var(--ink-3); font-weight: 400; }
+
+  /* ---- math ---- */
+  .eq {
+    font-family: var(--serif); background: var(--panel);
+    border: 1px solid var(--line); border-left: 3px solid var(--soma);
+    border-radius: 3px; padding: .85rem 1.1rem; margin: 1.1rem 0;
+    overflow-x: auto; font-size: 1.02rem; line-height: 1.9;
+  }
+  .eq.dend  { border-left-color: var(--dend); }
+  .eq.time  { border-left-color: var(--danger); }
+  .eq .lbl { display:block; font-family: var(--mono); font-size:.68rem; letter-spacing:.1em;
+             text-transform: uppercase; color: var(--ink-3); margin-bottom: .35rem; }
+  var, .v { font-style: italic; font-family: var(--serif); }
+  .eq sub, .eq sup { font-style: normal; }
+  sub, sup { font-size: .72em; line-height: 0; }
+  .op { font-style: normal; padding: 0 .12em; color: var(--ink-2); }
+  code, .k {
+    font-family: var(--mono); font-size: .86em; background: var(--panel-2);
+    padding: .08em .38em; border-radius: 4px; color: var(--ink);
+    border: 1px solid var(--line);
+  }
+  .eq code, .eq .k { background: transparent; border: none; padding: 0; }
+
+  /* ---- difference chips ---- */
+  .chip {
+    display: inline-flex; align-items: center; gap: .4em; font-family: var(--mono);
+    font-size: .68rem; letter-spacing: .04em; text-transform: uppercase; font-weight: 600;
+    padding: .18em .55em; border-radius: 999px; white-space: nowrap; vertical-align: middle;
+  }
+  .chip::before { content: ""; width: .55em; height: .55em; border-radius: 50%; background: currentColor; }
+  .c1 { color: var(--dend);   background: var(--dend-bg); }
+  .c2 { color: var(--danger); background: var(--danger-bg); }
+  .c3 { color: var(--scale);  background: var(--scale-bg); }
+  .cok{ color: var(--soma);   background: var(--soma-bg); }
+
+  /* ---- callout ---- */
+  .call { border: 1px solid var(--line); border-radius: 8px; padding: 1.1rem 1.25rem; margin: 1.3rem 0; background: var(--panel); }
+  .call.c1 { border-color: color-mix(in srgb, var(--dend) 45%, var(--line)); background: color-mix(in srgb, var(--dend-bg) 55%, var(--panel)); }
+  .call.c2 { border-color: color-mix(in srgb, var(--danger) 45%, var(--line)); background: color-mix(in srgb, var(--danger-bg) 55%, var(--panel)); }
+  .call.c3 { border-color: color-mix(in srgb, var(--scale) 45%, var(--line)); background: color-mix(in srgb, var(--scale-bg) 55%, var(--panel)); }
+  .call h4 { margin: 0 0 .5rem; font-size: 1.05rem; display: flex; align-items: center; gap: .6rem; flex-wrap: wrap; }
+  .call p:last-child { margin-bottom: 0; }
+  .call p:first-of-type { margin-top: .2rem; }
+
+  /* ---- meta strip ---- */
+  .meta { display: flex; flex-wrap: wrap; gap: .5rem .5rem; margin-top: 1.6rem; }
+  .meta span {
+    font-family: var(--mono); font-size: .74rem; color: var(--ink-2);
+    background: var(--panel); border: 1px solid var(--line); border-radius: 5px; padding: .3em .6em;
+  }
+  .meta b { color: var(--ink); font-weight: 600; }
+
+  /* ---- schematic ---- */
+  .schematic { margin: 2rem 0 .5rem; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 1.2rem; overflow-x: auto; }
+  .schematic svg { display: block; width: 100%; min-width: 560px; height: auto; }
+  .schematic svg text { font-family: var(--mono); }
+  .e-soma { stroke: var(--soma); fill: none; }
+  .e-dend { stroke: var(--dend); fill: none; }
+  .e-time { stroke: var(--danger); fill: none; }
+  .mk-soma { fill: var(--soma); } .mk-dend { fill: var(--dend); } .mk-time { fill: var(--danger); }
+  .t-ink { fill: var(--ink); } .t-dend { fill: var(--dend); } .t-time { fill: var(--danger); }
+  .node-io { fill: var(--panel-2); stroke: var(--line-2); }
+  .node-h  { fill: var(--soma-bg); stroke: var(--soma); }
+  .legend { display: flex; flex-wrap: wrap; gap: 1rem 1.4rem; margin-top: .5rem; font-family: var(--mono); font-size: .74rem; color: var(--ink-2); }
+  .legend i { display: inline-block; width: 26px; height: 0; vertical-align: middle; margin-right: .5em; }
+
+  /* ---- comparison grid ---- */
+  .cmp { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin: 1.3rem 0; }
+  .cmp > div { border: 1px solid var(--line); border-radius: 8px; padding: 1rem 1.1rem; background: var(--panel); }
+  .cmp .exact { border-top: 3px solid var(--soma); }
+  .cmp .hand  { border-top: 3px solid var(--dend); }
+  .cmp h4 { margin: 0 0 .4rem; font-size: .8rem; font-family: var(--mono); letter-spacing:.08em; text-transform: uppercase; color: var(--ink-2); }
+  @media (max-width: 720px) { .cmp { grid-template-columns: 1fr; } }
+
+  /* ---- table ---- */
+  .tablewrap { overflow-x: auto; margin: 1.4rem 0; border: 1px solid var(--line); border-radius: 8px; }
+  table { border-collapse: collapse; width: 100%; min-width: 720px; font-size: .95rem; }
+  thead th { text-align: left; font-family: var(--mono); font-size: .72rem; letter-spacing: .06em; text-transform: uppercase;
+             color: var(--ink-2); background: var(--panel-2); padding: .7rem .85rem; border-bottom: 1px solid var(--line-2); }
+  td { padding: .7rem .85rem; border-bottom: 1px solid var(--line); vertical-align: top; background: var(--panel); }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr:hover td { background: color-mix(in srgb, var(--soma-bg) 40%, var(--panel)); }
+  td.factor { font-weight: 600; width: 20%; }
+  td .diff { display: inline-block; margin-top: .35rem; }
+
+  /* ---- stat grid ---- */
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: .85rem; margin: 1.4rem 0; }
+  .stat { border: 1px solid var(--line); border-radius: 8px; padding: .95rem 1.05rem; background: var(--panel); }
+  .stat .k { font-family: var(--mono); font-size: .7rem; letter-spacing: .06em; text-transform: uppercase; color: var(--ink-3); background: none; border: none; padding: 0; }
+  .stat .val { font-family: var(--mono); font-size: 1.5rem; font-weight: 600; color: var(--ink); margin: .35rem 0 .2rem; font-variant-numeric: tabular-nums; }
+  .stat .val.soma { color: var(--soma); }
+  .stat .val.dend { color: var(--dend); }
+  .stat .val.danger { color: var(--danger); }
+  .stat small { color: var(--ink-2); font-size: .82rem; }
+
+  pre { background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--ink-3);
+        border-radius: 3px; padding: .9rem 1.1rem; overflow-x: auto; font-family: var(--mono); font-size: .85rem; line-height: 1.6; }
+  pre code { background: none; border: none; padding: 0; font-size: inherit; }
+
+  footer { margin-top: 4rem; padding-top: 1.4rem; border-top: 1px solid var(--line-2); color: var(--ink-3); font-family: var(--mono); font-size: .76rem; }
+  ul.tight { margin: .6rem 0; padding-left: 1.2rem; }
+  ul.tight li { margin: .3rem 0; }
+  ::selection { background: color-mix(in srgb, var(--soma) 30%, transparent); }
+  a:focus-visible, tr:focus-visible { outline: 2px solid var(--soma); outline-offset: 2px; }
+</style>
+
+<div class="page">
+  <header>
+    <p class="eyebrow">Dendro · BPTT_fix vs BPTT_fix_auto</p>
+    <h1>Where the two backward passes diverge</h1>
+    <p class="standfirst">Both rules run the <em>same</em> forward pass and read out the same loss. Only the gradient differs. Here is the chain rule, term by term, for a two-hidden-layer network — and the exact three places the hand-derived rule departs from what autodiff computes.</p>
+
+    <div class="meta">
+      <span><b>Network</b> x → L1 → L2 → readout</span>
+      <span><b>L1, L2</b> two-compartment (soma + dendrite)</span>
+      <span><b>Readout</b> leaky integrator, mean-voltage softmax CE</span>
+      <span><b>Shared</b> config · two_comp_neuron · lif_neuron (byte-identical)</span>
+      <span><b>Differs</b> only network.py</span>
+    </div>
+
+    <div class="schematic" aria-label="Forward network: soma edges kept, dendrite edges pruned inter-layer">
+      <svg viewBox="0 0 760 220" role="img">
+        <defs>
+          <marker id="ah" markerWidth="8" markerHeight="8" refX="6.5" refY="3" orient="auto">
+            <path d="M0,0 L7,3 L0,6 Z" class="mk-soma"/>
+          </marker>
+          <marker id="ahd" markerWidth="8" markerHeight="8" refX="6.5" refY="3" orient="auto">
+            <path d="M0,0 L7,3 L0,6 Z" class="mk-dend"/>
+          </marker>
+          <marker id="ahr" markerWidth="9" markerHeight="9" refX="6.5" refY="3" orient="auto">
+            <path d="M0,0 L7,3 L0,6 Z" class="mk-time"/>
+          </marker>
+        </defs>
+        <!-- soma edges (solid blue) -->
+        <line x1="120" y1="96" x2="250" y2="96" class="e-soma" stroke-width="2.4" marker-end="url(#ah)"/>
+        <line x1="360" y1="96" x2="490" y2="96" class="e-soma" stroke-width="2.4" marker-end="url(#ah)"/>
+        <line x1="600" y1="96" x2="662" y2="96" class="e-soma" stroke-width="2.4" marker-end="url(#ah)"/>
+        <!-- dendrite edges (dashed ochre), curved to a lower entry -->
+        <path d="M120,120 C185,168 195,168 250,132" class="e-dend" stroke-width="2.2" stroke-dasharray="6 5" marker-end="url(#ahd)"/>
+        <path d="M360,120 C425,168 435,168 490,132" class="e-dend" stroke-width="2.2" stroke-dasharray="6 5" marker-end="url(#ahd)"/>
+        <text x="185" y="192" class="t-dend" font-size="12" text-anchor="middle">W_d · jump to t′</text>
+        <text x="425" y="192" class="t-dend" font-size="12" text-anchor="middle">W_d · jump to t′</text>
+        <!-- backward exploding recurrence hint on L1 soma -->
+        <path d="M300,70 C280,40 340,40 320,70" class="e-time" stroke-width="2" marker-end="url(#ahr)"/>
+        <text x="310" y="30" class="t-time" font-size="11" text-anchor="middle">αₛ, reset ↺</text>
+        <!-- nodes -->
+        <g font-size="13" text-anchor="middle">
+          <circle cx="95"  cy="96" r="26" class="node-io"/>
+          <text x="95"  y="100" class="t-ink">x</text>
+          <circle cx="305" cy="96" r="30" class="node-h"/>
+          <text x="305" y="100" class="t-ink">L1</text>
+          <circle cx="545" cy="96" r="30" class="node-h"/>
+          <text x="545" y="100" class="t-ink">L2</text>
+          <circle cx="690" cy="96" r="26" class="node-io"/>
+          <text x="690" y="93" class="t-ink">read</text>
+          <text x="690" y="107" class="t-ink">out</text>
+        </g>
+      </svg>
+      <div class="legend">
+        <span><i style="border-top:2.4px solid var(--soma)"></i>soma edge <b>W<sub>s</sub></b> — same time <var>t</var>, kept by both rules</span>
+        <span><i style="border-top:2.2px dashed var(--dend)"></i>dendrite edge <b>W<sub>d</sub></b> — jumps to plateau onset <var>t</var>′, <b>pruned inter-layer</b> by the hand rule</span>
+        <span><i style="border-top:2px solid var(--danger)"></i>within-layer time recurrence — exact backprops it, e-prop truncates it</span>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <!-- ============================================================= -->
+    <section id="differences">
+      <div class="sec-head"><h2>The whole story in three differences</h2></div>
+      <p>Set the loss <var>ℓ</var> and the forward pass aside for a moment. Given identical spikes, the exact gradient (<code>BPTT_fix_auto</code>, one scalar loss through <code>jax.grad</code>) and the hand rule (<code>BPTT_fix</code>, two forward passes, no autodiff) can differ in only three ways. Every term below is one of these three colors.</p>
+
+      <div class="call c1">
+        <h4><span class="chip c1">#1</span> The inter-layer dendrite edge is pruned</h4>
+        <p>A spike <var>o</var><sup>l−1</sup> reaches the next layer through <em>two</em> edges: the same-time <strong style="color:var(--soma)">soma</strong> edge, and a <strong style="color:var(--dend)">dendrite</strong> edge that jumps to the plateau-onset time <var>t</var>′. Exact BPTT credits both. The hand rule transports error between layers through the soma weights only — the dendrite is descended into <em>locally</em> (to train <var>W</var><sub>d</sub><sup>l</sup>) but carries no error back to <var>o</var><sup>l−1</sup>. <strong>This difference does not exist in a one-hidden-layer net</strong> — it needs a layer below to feel the missing edge.</p>
+      </div>
+
+      <div class="call c2">
+        <h4><span class="chip c2">#2</span> Time credit: backward adjoint → forward eligibility</h4>
+        <p>Exact BPTT backpropagates through the <var>α</var><sub>s</sub>/<var>α</var><sub>d</sub> membrane recurrences, the reset <var>v</var> = <var>v</var><sub>pre</sub>(1−<var>o</var>), and adaptation. The hand rule replaces that entire backward-in-time chain with <strong>forward eligibility traces</strong> (e-prop). Iterated across a plateau the exact recurrence has spectral radius &gt; 1, so its gradient <strong>explodes exponentially</strong>; the e-prop trace stays bounded.</p>
+      </div>
+
+      <div class="call c3">
+        <h4><span class="chip c3">#3</span> Two deliberate rescalings</h4>
+        <p>The hand rule drops the softmax <var>1/temperature</var> factor everywhere and divides the soma gradient by <code>_SOMA_GRAD_SCALE = 8</code>. Pure magnitude — undo them and the direction is unchanged. Below, “fix (norm)” means the hand gradient with these undone.</p>
+      </div>
+    </section>
+
+    <!-- ============================================================= -->
+    <section id="forward">
+      <div class="sec-head"><span class="n">§1</span><h2>The forward pass — identical for both</h2></div>
+      <p>One hidden layer <var>l</var> at step <var>t</var>, with presynaptic input <var>o</var><sup>l−1</sup>[<var>t</var>] (or the raw input <var>x</var>[<var>t</var>] for <var>l</var> = 1). Two compartments feed one spike. Both folders compute exactly this; the predictions match bit-for-bit.</p>
+
+      <div class="eq dend">
+        <span class="lbl">dendrite — integrate, latch a plateau</span>
+        <var>μ</var><sup>l</sup>[<var>t</var>] <span class="op">=</span> <var>α</var><sub>d</sub> <var>μ</var><sup>l</sup>[<var>t</var>−1] <span class="op">+</span> (1 − <var>h</var><sup>l</sup>[<var>t</var>−1]) · (<var>W</var><sub>d</sub><sup>l</sup> <var>o</var><sup>l−1</sup>[<var>t</var>])<br>
+        <var>h</var><sup>l</sup>[<var>t</var>] <span class="op">=</span> Θ( <var>μ̂</var><sup>l</sup>[<var>t</var>] − <var>μ</var><sub>th</sub> ) · 𝟙[ 0 ≤ <var>t</var> − <var>t</var>′ ≤ <var>T</var><sub>p</sub> ]
+        &nbsp;&nbsp;<span style="color:var(--ink-3)">— <var>μ̂</var> = <var>μ</var> frozen at onset <var>t</var>′; latches for <var>T</var><sub>p</sub> steps</span>
+      </div>
+
+      <div class="eq">
+        <span class="lbl">soma — integrate, fire, reset, adapt</span>
+        <var>v</var><sub>pre</sub><sup>l</sup>[<var>t</var>] <span class="op">=</span> <var>α</var><sub>s</sub> <var>v</var><sup>l</sup>[<var>t</var>−1] <span class="op">+</span> <var>W</var><sub>s</sub><sup>l</sup> <var>o</var><sup>l−1</sup>[<var>t</var>] <span class="op">−</span> <var>w</var><sub>adapt</sub><sup>l</sup>[<var>t</var>]<br>
+        <var>o</var><sup>l</sup>[<var>t</var>] <span class="op">=</span> Θ( <var>v</var><sub>pre</sub><sup>l</sup>[<var>t</var>] <span class="op">+</span> <var>γ</var> <var>h</var><sup>l</sup>[<var>t</var>] − <var>v</var><sub>th</sub> )
+        &nbsp;&nbsp;<span style="color:var(--ink-3)">— a plateau lowers the threshold by <var>γ</var></span><br>
+        <var>v</var><sup>l</sup>[<var>t</var>] <span class="op">=</span> <var>v</var><sub>pre</sub><sup>l</sup>[<var>t</var>] (1 − <var>o</var><sup>l</sup>[<var>t</var>])
+        &nbsp;&nbsp;<span style="color:var(--ink-3)">— hard reset on spike</span>
+      </div>
+
+      <div class="eq">
+        <span class="lbl">readout — leaky integrator, no threshold, then loss</span>
+        <var>v</var><sub>r</sub>[<var>t</var>] <span class="op">=</span> <var>α</var><sub>m</sub> <var>v</var><sub>r</sub>[<var>t</var>−1] <span class="op">+</span> <var>W</var><sub>r</sub> <var>o</var><sup>L</sup>[<var>t</var>]
+        &nbsp;·&nbsp; <span class="v">mean_v</span> <span class="op">=</span> (1/<var>T</var>) Σ<sub><var>t</var></sub> <var>v</var><sub>r</sub>[<var>t</var>]<br>
+        <var>p</var> <span class="op">=</span> softmax( <span class="v">mean_v</span> / <var>τ</var> <span class="op">+</span> <var>b</var> )
+        &nbsp;·&nbsp; <var>ℓ</var> <span class="op">=</span> − Σ <var>target</var> · log <var>p</var>
+      </div>
+
+      <p>Two hard thresholds Θ are the only non-differentiable steps. Both rules give them the <em>same</em> surrogate slope, <var>σ</var>(<var>z</var>) = 1 / (1 + <var>β</var>|<var>z</var>|)². Write <var>s′</var><sub>s</sub> = <var>σ</var>(<var>v</var><sub>pre</sub>+<var>γh</var>−<var>v</var><sub>th</sub>) and <var>s′</var><sub>d</sub> = <var>σ</var>(<var>μ̂</var>−<var>μ</var><sub>th</sub>). From the spike equation, the two local derivatives that matter are:</p>
+      <div class="eq">
+        ∂<var>o</var><sup>l</sup>/∂<var>v</var><sub>pre</sub><sup>l</sup> <span class="op">=</span> <var>s′</var><sub>s</sub>
+        &nbsp;&nbsp;&nbsp;&nbsp;
+        ∂<var>o</var><sup>l</sup>/∂<var>h</var><sup>l</sup> <span class="op">=</span> <var>γ</var> <var>s′</var><sub>s</sub>
+        &nbsp;&nbsp;&nbsp;&nbsp;
+        ∂<var>h</var><sup>l</sup>/∂<var>μ̂</var><sup>l</sup> <span class="op">=</span> <var>s′</var><sub>d</sub>
+      </div>
+      <p>Integer routing — <var>t</var>′, the timing gate 𝟙[·] — carries zero gradient in both, exactly as in exact BPTT with a surrogate. Everything up to here is shared. From now on the two rules differ.</p>
+    </section>
+
+    <!-- ============================================================= -->
+    <section id="exact">
+      <div class="sec-head"><span class="n">§2</span><h2>The exact chain rule — what autodiff computes</h2></div>
+      <p>Reverse mode walks the loss backward. Start at the top and descend; nothing is pruned.</p>
+
+      <h3>Loss → readout → the spikes of the top layer</h3>
+      <p>Because <span class="v">mean_v</span> averages <var>v</var><sub>r</sub> and <var>v</var><sub>r</sub> leaks with <var>α</var><sub>m</sub>, unrolling the readout gives a spike at time <var>t</var> a weight that sums its entire future decay. That geometric sum is exactly the <var>ρ</var>[<var>t</var>] the hand rule precomputes — so the readout adjoint is closed-form and identical in both:</p>
+      <div class="eq">
+        <span class="lbl">error signal & readout weighting</span>
+        <var>e</var> <span class="op">=</span> <var>target</var> − <var>p</var>
+        &nbsp;·&nbsp;
+        ∂<var>ℓ</var>/∂<span class="v">mean_v</span> <span class="op">=</span> −<var>e</var> / <var>τ</var>
+        &nbsp;·&nbsp;
+        <var>ρ</var>[<var>t</var>] <span class="op">=</span> (1/<var>T</var>) Σ<sub><var>s</var> ≥ <var>t</var></sub> <var>α</var><sub>m</sub><sup><var>s</var>−<var>t</var></sup> <span class="op">=</span> (1/<var>T</var>) (1 − <var>α</var><sub>m</sub><sup><var>T</var>−<var>t</var></sup>) / (1 − <var>α</var><sub>m</sub>)<br>
+        ∂<var>ℓ</var>/∂<var>o</var><sup>L</sup>[<var>t</var>] <span class="op">⊃</span> −(1/<var>τ</var>) <var>ρ</var>[<var>t</var>] <var>W</var><sub>r</sub><sup>⊤</sup> <var>e</var>
+        &nbsp;&nbsp;<span style="color:var(--ink-3)">(the readout contribution; downstream layers add more)</span>
+      </div>
+
+      <h3>Into a layer: the spike, the two compartments, and time</h3>
+      <p>The adjoint of a spike <var>o</var><sup>l</sup>[<var>t</var>] splits at the spike equation into a soma branch and a plateau branch, and — this is the part that matters — the soma branch <em>also</em> accumulates a backward-in-time chain, because <var>v</var><sub>pre</sub><sup>l</sup>[<var>t</var>] fed forward into <var>v</var><sub>pre</sub><sup>l</sup>[<var>t</var>+1] (through <var>α</var><sub>s</sub>), into the reset, and into adaptation:</p>
+      <div class="eq time">
+        <span class="lbl">soma adjoint — instantaneous term + backward-in-time recurrence</span>
+        <var>λ</var><sub>v</sub><sup>l</sup>[<var>t</var>] <span class="op">≡</span> ∂<var>ℓ</var>/∂<var>v</var><sub>pre</sub><sup>l</sup>[<var>t</var>] <span class="op">=</span>
+        <span style="color:var(--soma)">(∂<var>ℓ</var>/∂<var>o</var><sup>l</sup>[<var>t</var>]) <var>s′</var><sub>s</sub>[<var>t</var>]</span>
+        <span class="op">+</span>
+        <span style="color:var(--danger)"><var>α</var><sub>s</sub> <var>λ</var><sub>v</sub><sup>l</sup>[<var>t</var>+1] (1 − <var>o</var><sup>l</sup>[<var>t</var>]) <span class="op">+</span> (reset & adaptation terms)</span>
+      </div>
+      <p>The <span style="color:var(--soma)">blue</span> term is instantaneous and local. The <span style="color:var(--danger)">red</span> term reaches back from the future — and it is a <em>recurrence</em>: to get <var>λ</var><sub>v</sub>[<var>t</var>] you already needed <var>λ</var><sub>v</sub>[<var>t</var>+1]. Composed step after step through a latched plateau, its per-step Jacobian has magnitude &gt; 1, so the adjoint grows geometrically as the plateau lengthens. <em>This</em> is the exploding gradient.</p>
+
+      <h3>Between layers: both edges</h3>
+      <p>Now push from layer <var>l</var> down to <var>o</var><sup>l−1</sup>. The presynaptic spike entered layer <var>l</var> twice — as soma drive and as dendrite drive — so its adjoint collects <em>both</em> transposed weights:</p>
+      <div class="eq">
+        <span class="lbl">exact inter-layer transport — soma edge + dendrite edge</span>
+        ∂<var>ℓ</var>/∂<var>o</var><sup>l−1</sup>[<var>t</var>] <span class="op">=</span>
+        <span style="color:var(--soma)">(<var>W</var><sub>s</sub><sup>l</sup>)<sup>⊤</sup> <var>λ</var><sub>v</sub><sup>l</sup>[<var>t</var>]</span>
+        <span class="op">+</span>
+        <span style="color:var(--dend)">(<var>W</var><sub>d</sub><sup>l</sup>)<sup>⊤</sup> <var>λ</var><sub>μ</sub><sup>l</sup>[<var>t</var>]</span>
+      </div>
+      <p>where <var>λ</var><sub>μ</sub><sup>l</sup> routes back through <var>γ</var> <var>s′</var><sub>s</sub> · <var>s′</var><sub>d</sub> and the plateau’s <var>t</var>→<var>t</var>′ scatter. Follow both edges across <var>L</var> layers and you get a binary tree of 2<sup><var>L</var></sup> root-to-leaf paths, each with its own <var>t</var>′ time-shift. Finally the weight gradients are outer products of an adjoint with the presynaptic activity:</p>
+      <div class="eq">
+        ∂<var>ℓ</var>/∂<var>W</var><sub>s</sub><sup>l</sup> <span class="op">=</span> Σ<sub><var>t</var></sub> <var>λ</var><sub>v</sub><sup>l</sup>[<var>t</var>] ⊗ <var>o</var><sup>l−1</sup>[<var>t</var>]
+        &nbsp;&nbsp;·&nbsp;&nbsp;
+        ∂<var>ℓ</var>/∂<var>W</var><sub>d</sub><sup>l</sup> <span class="op">=</span> Σ<sub><var>t</var></sub> <var>λ</var><sub>μ</sub><sup>l</sup>[<var>t</var>] ⊗ <var>o</var><sup>l−1</sup>[<var>t</var>′]
+      </div>
+    </section>
+
+    <!-- ============================================================= -->
+    <section id="hand">
+      <div class="sec-head"><span class="n">§3</span><h2>The hand rule — aligned to §2, term by term</h2></div>
+      <p><code>BPTT_fix</code> runs the forward twice: pass 1 gets the error <var>e</var>; pass 2 re-runs the forward and accumulates gradients through a <strong>soma-only backbone</strong>, contracting an <em>instantaneous</em> learning signal against <em>forward</em> eligibility traces. Line it up against §2:</p>
+
+      <div class="cmp">
+        <div class="exact">
+          <h4>Top rung — identical</h4>
+          <div class="eq" style="margin:.3rem 0 0; border-left-color:var(--soma)">
+            <var>δo</var><sup>L</sup>[<var>t</var>] <span class="op">=</span> <var>ρ</var>[<var>t</var>] (<var>W</var><sub>r</sub><sup>⊤</sup> <var>e</var>)
+          </div>
+          <p style="margin:.6rem 0 0; font-size:.9rem; color:var(--ink-2)">Same <var>ρ</var>[<var>t</var>] as the exact readout adjoint. Matches up to the <span class="chip c3">#3</span> <var>1/τ</var>.</p>
+        </div>
+        <div class="hand">
+          <h4>Spike → soma — instantaneous only</h4>
+          <div class="eq" style="margin:.3rem 0 0">
+            <var>Lv</var><sup>l</sup>[<var>t</var>] <span class="op">=</span> <var>δo</var><sup>l</sup>[<var>t</var>] · <var>s′</var><sub>s</sub><sup>l</sup>[<var>t</var>]
+          </div>
+          <p style="margin:.6rem 0 0; font-size:.9rem; color:var(--ink-2)">This is §2’s <span style="color:var(--soma)">blue</span> term with the <span style="color:var(--danger)">red</span> backward-in-time recurrence dropped. <span class="chip c2">#2</span></p>
+        </div>
+      </div>
+
+      <div class="eq dend">
+        <span class="lbl">inter-layer transport — soma backbone only (dendrite edge dropped) <span class="chip c1" style="margin-left:.4rem">#1</span></span>
+        <var>δo</var><sup>l−1</sup>[<var>t</var>] <span class="op">=</span>
+        <span style="color:var(--soma)">(<var>W</var><sub>s</sub><sup>l</sup>)<sup>⊤</sup> <var>Lv</var><sup>l</sup>[<var>t</var>]</span>
+        <span style="color:var(--dend); text-decoration: line-through; opacity:.6">&nbsp;+ (W<sub>d</sub><sup>l</sup>)<sup>⊤</sup> λ<sub>μ</sub><sup>l</sup>[t]&nbsp;</span>
+        <span style="color:var(--dend); font-family:var(--mono); font-size:.8rem">← pruned</span>
+      </div>
+
+      <div class="eq">
+        <span class="lbl">weight gradients — instantaneous signal ⊗ forward eligibility (e-prop) <span class="chip c2" style="margin-left:.4rem">#2</span></span>
+        <var>E</var><sub>s</sub><sup>l</sup>[<var>t</var>] <span class="op">=</span> Σ<sub><var>s</var> ≤ <var>t</var></sub> <var>α</var><sub>s</sub><sup><var>t</var>−<var>s</var></sup> <var>o</var><sup>l−1</sup>[<var>s</var>]
+        &nbsp;&nbsp;<span style="color:var(--ink-3)">— forward somatic eligibility (spreads credit <em>forward</em>, not back)</span><br>
+        grad <var>W</var><sub>s</sub><sup>l</sup> <span class="op">=</span> Σ<sub><var>t</var></sub> <var>Lv</var><sup>l</sup>[<var>t</var>] ⊗ <var>E</var><sub>s</sub><sup>l</sup>[<var>t</var>]
+        <span style="color:var(--scale)"> / 8</span>
+        &nbsp;·&nbsp;
+        grad <var>W</var><sub>d</sub><sup>l</sup> <span class="op">=</span> Σ<sub><var>t</var></sub> (<var>Lv</var><sup>l</sup>[<var>t</var>] <var>γ</var> <var>s′</var><sub>d</sub><sup>l</sup>[<var>t</var>]) ⊗ <var>P̂</var><sup>l</sup>[<var>t</var>]
+      </div>
+      <p><var>P̂</var><sup>l</sup> is the dendritic eligibility frozen at the plateau onset <var>t</var>′ (<code>dmu_dw_at_tprime</code>). Notice the dendrite gradient still carries <var>γ s′</var><sub>d</sub>: the dendrite reaches the output only through the soma spike, so it must ride on <var>Lv</var> (= <var>δo</var>·<var>s′</var><sub>s</sub>), not bare <var>δo</var>. The dendrite is trained; it just can’t pass error to the layer below it.</p>
+
+      <div class="call c2">
+        <h4>Why swapping the backward adjoint for a forward trace matters</h4>
+        <p>Exact BPTT contracts a <em>backward-accumulated</em> adjoint <var>λ</var><sub>v</sub>[<var>t</var>] against <var>o</var><sup>l−1</sup>[<var>t</var>]. The hand rule contracts the <em>instantaneous</em> signal <var>Lv</var>[<var>t</var>] against a <em>forward-accumulated</em> eligibility <var>E</var><sub>s</sub>[<var>t</var>]. They are transpose-like approximations of the same temporal credit — but e-prop simply omits the reset/adaptation adjoint whose composition blows up. That is the entire reason one gradient stays ~O(1) and the other reaches 10<sup>10</sup>.</p>
+      </div>
+    </section>
+
+    <!-- ============================================================= -->
+    <section id="table">
+      <div class="sec-head"><span class="n">§4</span><h2>Every factor, side by side</h2></div>
+      <p>One row per link in the chain. The right column is the consequence, tagged with the difference it belongs to.</p>
+      <div class="tablewrap">
+        <table>
+          <thead>
+            <tr><th>Chain-rule factor</th><th>Exact (autodiff)</th><th>Hand rule (BPTT_fix)</th><th>Difference &amp; consequence</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td class="factor">Loss → mean_v</td>
+              <td>−<var>e</var> / <var>τ</var></td>
+              <td>−<var>e</var> &nbsp;<span style="color:var(--ink-3)">(1/<var>τ</var> dropped)</span></td>
+              <td>Direction identical, magnitude ×<var>τ</var>. <span class="diff"><span class="chip c3">#3 scale</span></span></td>
+            </tr>
+            <tr>
+              <td class="factor">Readout adjoint <var>ρ</var>[<var>t</var>]</td>
+              <td>Σ<sub><var>s</var>≥<var>t</var></sub> <var>α</var><sub>m</sub><sup><var>s−t</var></sup> / <var>T</var></td>
+              <td>same closed form (precomputed)</td>
+              <td>Exact in both. <span class="diff"><span class="chip cok">match</span></span></td>
+            </tr>
+            <tr>
+              <td class="factor">∂<var>o</var>/∂<var>v</var><sub>pre</sub>, ∂<var>o</var>/∂<var>h</var>, ∂<var>h</var>/∂<var>μ</var></td>
+              <td><var>s′</var><sub>s</sub>, <var>γs′</var><sub>s</sub>, <var>s′</var><sub>d</sub></td>
+              <td>same surrogate <var>σ</var>=1/(1+<var>β</var>|·|)²</td>
+              <td>Identical slopes. <span class="diff"><span class="chip cok">match</span></span></td>
+            </tr>
+            <tr>
+              <td class="factor">Within-layer time credit</td>
+              <td>backward adjoint through <var>α</var><sub>s</sub>, <var>α</var><sub>d</sub>, reset, adapt</td>
+              <td>forward eligibility <var>E</var><sub>s</sub>, <var>P̂</var>; no backward chain</td>
+              <td>Bounded vs. exponential blow-up through the plateau. <span class="diff"><span class="chip c2">#2 time</span></span></td>
+            </tr>
+            <tr>
+              <td class="factor">Inter-layer soma edge</td>
+              <td>(<var>W</var><sub>s</sub><sup>l</sup>)<sup>⊤</sup> <var>λ</var><sub>v</sub></td>
+              <td>(<var>W</var><sub>s</sub><sup>l</sup>)<sup>⊤</sup> <var>Lv</var></td>
+              <td>Same edge, kept. <span class="diff"><span class="chip cok">match</span></span></td>
+            </tr>
+            <tr>
+              <td class="factor">Inter-layer dendrite edge</td>
+              <td>(<var>W</var><sub>d</sub><sup>l</sup>)<sup>⊤</sup> <var>λ</var><sub>μ</sub> &nbsp;<span style="color:var(--ink-3)">(via <var>t</var>′)</span></td>
+              <td>— dropped —</td>
+              <td>Missing error path; only visible with ≥2 hidden layers. <span class="diff"><span class="chip c1">#1 prune</span></span></td>
+            </tr>
+            <tr>
+              <td class="factor">Weight contraction</td>
+              <td><var>λ</var> ⊗ <var>o</var><sup>l−1</sup></td>
+              <td><var>Lv</var> ⊗ <var>E</var><sub>s</sub> &nbsp;/&nbsp; (<var>Lv γs′</var><sub>d</sub>) ⊗ <var>P̂</var></td>
+              <td>e-prop factorization of the same outer product. <span class="diff"><span class="chip c2">#2 time</span></span></td>
+            </tr>
+            <tr>
+              <td class="factor">Overall scale</td>
+              <td>true gradient</td>
+              <td>soma ÷ 8</td>
+              <td>Balances soma vs. dendrite magnitude. <span class="diff"><span class="chip c3">#3 scale</span></span></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p><strong>Which difference dominates when?</strong> The readout is identical up to <span class="chip c3">#3</span>. In a <em>single</em> hidden layer only <span class="chip c2">#2</span> and <span class="chip c3">#3</span> can appear — <span class="chip c1">#1</span> is invisible because there is no layer beneath to receive the missing edge. Add a second hidden layer and <span class="chip c1">#1</span> switches on for every layer that is not the top one.</p>
+    </section>
+
+    <!-- ============================================================= -->
+    <section id="measured">
+      <div class="sec-head"><span class="n">§5</span><h2>Measured on a real two-layer net</h2></div>
+      <p><code>analysis/compare_backward.py</code> builds one <span class="prose-num">3 → 6 → 6 → 2</span> network and hands the identical weights to both rules. To isolate <span class="chip c1">#1</span> by itself it adds a third gradient — <strong>auto_prune</strong>: exact autodiff, but with the inter-layer dendrite input <code>stop_gradient</code>’d, so it prunes exactly what the hand rule prunes while keeping the exact time adjoint. The decomposition then reads cleanly:</p>
+      <ul class="tight">
+        <li><strong>auto_full ↔ auto_prune</strong> — isolates <span class="chip c1">#1</span>, the pruned dendrite edge.</li>
+        <li><strong>auto_prune ↔ fix (norm)</strong> — isolates <span class="chip c2">#2</span>, the e-prop time truncation.</li>
+        <li><strong>fix ↔ auto_full</strong> — the total.</li>
+      </ul>
+
+      <div class="stats">
+        <div class="stat">
+          <div class="k">Readout, fix(norm) vs exact</div>
+          <div class="val soma">cos 1.000</div>
+          <small>ratio ×5.00 = <var>τ</var> exactly — identical up to <span class="chip c3">#3</span></small>
+        </div>
+        <div class="stat">
+          <div class="k">#1 prune · top layer L2</div>
+          <div class="val">0.0000</div>
+          <small>‖full−prune‖/‖full‖ — nothing above it to prune</small>
+        </div>
+        <div class="stat">
+          <div class="k">#1 prune · lower layer L1</div>
+          <div class="val dend">0.068</div>
+          <small>soma (0.055 dend) — the inter-layer edge, made visible</small>
+        </div>
+        <div class="stat">
+          <div class="k">Exact adjoint into L2</div>
+          <div class="val dend">0.075</div>
+          <small>‖dendrite route‖ / ‖soma route‖ — size of what’s discarded</small>
+        </div>
+        <div class="stat">
+          <div class="k">Gradient growth vs plateau</div>
+          <div class="val danger">1.18×/step</div>
+          <small>exact (full &amp; pruned); hand rule 1.01×/step ≈ flat</small>
+        </div>
+        <div class="stat">
+          <div class="k">max|dW| at T = 175</div>
+          <div class="val danger">4.6e10</div>
+          <small>exact, vs. 0.78 for the hand rule</small>
+        </div>
+      </div>
+
+      <div class="call c2">
+        <h4>A sharper reading of “#2” than magnitude alone</h4>
+        <p>At the top layer, even <em>after</em> removing the prune and the rescalings, the direction agreement between the e-prop and exact gradients is only <strong>cos ≈ 0.09</strong>. Once the plateau recurrence dominates, e-prop is not a rescaled exact gradient — the two point almost orthogonally. The hand rule’s case is not “approximately the same gradient,” it is “a different, bounded, still-descending gradient.”</p>
+      </div>
+    </section>
+
+    <!-- ============================================================= -->
+    <section id="repro">
+      <div class="sec-head"><span class="n">§6</span><h2>Reproduce it</h2></div>
+      <p>Run on CPU (lightweight); figures land in <code>analysis/out/</code>.</p>
+      <pre><code>JAX_PLATFORMS=cpu ~/miniconda3/envs/dendroprop/bin/python \
+  analysis/compare_backward.py --hidden 6 6 --seed 16 --amp 4.0 --T 60</code></pre>
+      <ul class="tight">
+        <li><code>backward_forward_L0/L1.png</code> — the shared forward dynamics per layer (μ, plateau, v, spikes).</li>
+        <li><code>backward_grad_L0/L1.png</code> — per-weight fix(norm) vs auto_prune vs auto_full. On L1 the gap to auto_full is <span class="chip c1">#1</span>; the huge symlog jump to the exact bars is <span class="chip c2">#2</span>.</li>
+        <li><code>backward_explosion.png</code> — magnitude vs sequence length: fix hugs the clip line, both exact variants blow up together.</li>
+        <li><code>backward_summary.md</code> — the full per-layer numeric decomposition printed above.</li>
+      </ul>
+      <p>Flags: <code>--hidden a b c</code> for more layers, <code>--sweep</code> for the explosion lengths, <code>--seed</code> to reroll (the default is chosen so both layers spike and plateau).</p>
+    </section>
+  </main>
+
+  <footer>
+    Dendro · backward-pass comparison · forward identical, only network.py differs · derived from BPTT_fix/ &amp; BPTT_fix_auto/ and measured by analysis/compare_backward.py
+  </footer>
+</div>

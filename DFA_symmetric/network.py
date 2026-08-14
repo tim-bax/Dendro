@@ -31,9 +31,17 @@ _LOG_EPS = 1e-8
 #  accumulates two eligibility tensors of shape (N_l, N_{l-1}) during the
 #  forward scan; these are contracted AFTER the scan with a per-layer
 #  learning signal L_l = B_l^T · e, where e is the single end-of-sequence
-#  output error and B_l is a FIXED random feedback matrix (J, N_l). Because
-#  B_l is fixed and e is time-independent, L_l factors out of the time sum,
-#  so the accumulators never carry the output index J.
+#  output error and B_l is the layer's feedback matrix (J, N_l). Because B_l
+#  is time-independent and e is time-independent, L_l factors out of the time
+#  sum, so the accumulators never carry the output index J.
+#
+#  Feedback matrices (symmetric last layer): deeper hidden layers use FIXED
+#  random B_l (Direct Feedback Alignment). The LAST hidden layer — the only
+#  one directly connected to the readout — instead uses the live readout
+#  weights W_readout^T as its feedback, making its learning signal the exact
+#  partial derivative ∂E/∂z (symmetric e-prop, Bellec et al. 2020, Eq. 4).
+#  This is the closest approximation to symmetric e-prop available in a
+#  direct-feedback architecture that does not propagate error between layers.
 #
 #  weights pytree:  {"dend": [w_dend_0..], "soma": [w_soma_0..],
 #                    "readout": w_readout}
@@ -467,6 +475,13 @@ class Network:
         flat.append(g_readout)
         return flat
 
+    def _feedback_list(self):
+        # Symmetric last layer: the readout-connected hidden layer uses the live
+        # readout weights Wᵀ as its feedback (symmetric e-prop, Bellec Eq. 4);
+        # deeper layers keep their fixed random DFA matrices B_l. Handles a
+        # single hidden layer (self.B[:-1] → []) as the all-symmetric case.
+        return self.B[:-1] + [self.readout.w]
+
     def _tp_list(self):
         return [h.T_p for h in self.hidden]
 
@@ -558,7 +573,7 @@ class Network:
         )
 
         loss, pred, g_r, g_s_list, g_d_list = _loss_single(
-            mean_v, sum_Er, C_soma, A_dend, self.B,
+            mean_v, sum_Er, C_soma, A_dend, self._feedback_list(),
             self._smooth_targets(target), T,
             self.config.loss_temperature, self.config.loss_count_bias,
         )
@@ -586,7 +601,7 @@ class Network:
         )
 
         losses, preds, g_r, g_s_list, g_d_list = _loss_batch(
-            mean_v, sum_Er, C_soma, A_dend, self.B,
+            mean_v, sum_Er, C_soma, A_dend, self._feedback_list(),
             self._smooth_targets(targets), T,
             self.config.loss_temperature, self.config.loss_count_bias,
         )

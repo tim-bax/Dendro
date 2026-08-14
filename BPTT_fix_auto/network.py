@@ -2,18 +2,14 @@ import dataclasses
 import json
 
 import numpy as np
+import jax
 import jax.numpy as jnp
-from jax import random, jit, lax, vmap
+from jax import random, jit, lax, vmap, value_and_grad, custom_vjp
 
 from config import NeuronConfig, surrogate_sigma
 from two_comp_neuron import TwoCompNeuron
 from lif_neuron import LINeuron
 
-
-# Extra divisor on the somatic gradient only, balancing its magnitude against the
-# dendritic gradient (C_soma runs ~8x larger). Empirical, not derived — carried
-# over from the single-layer rule and applied per hidden layer.
-_SOMA_GRAD_SCALE = 8.0
 
 # Guards log(0) in the cross-entropy. Small enough not to bias the loss.
 _LOG_EPS = 1e-8
@@ -22,18 +18,31 @@ _LOG_EPS = 1e-8
 # ══════════════════════════════════════════════════════════════════════
 #  Core functions — each processes ONE sample.
 #
-#  DFA (Direct Feedback Alignment) with an arbitrary number of hidden
-#  layers. Every hidden layer is a TwoCompNeuron; layer 0 reads the input
-#  spikes, layer l>0 reads the (dropped) spikes of layer l-1, and the last
-#  hidden layer feeds the leaky-integrator readout.
+#  FULL SURROGATE BPTT via jax.grad — the "correct-gradient" counterpart to
+#  the hand-derived, pruned rule in ../BPTT_fix. Same network, same loss; the
+#  ONLY difference is how the hidden-layer gradients are obtained.
 #
-#  The learning rule is a per-layer three-factor rule. Each hidden layer l
-#  accumulates two eligibility tensors of shape (N_l, N_{l-1}) during the
-#  forward scan; these are contracted AFTER the scan with a per-layer
-#  learning signal L_l = B_l^T · e, where e is the single end-of-sequence
-#  output error and B_l is a FIXED random feedback matrix (J, N_l). Because
-#  B_l is fixed and e is time-independent, L_l factors out of the time sum,
-#  so the accumulators never carry the output index J.
+#  Here we write the whole forward (spike dynamics -> readout -> softmax CE)
+#  as one differentiable scalar loss(weights) and let reverse-mode autodiff
+#  compute the EXACT gradient. Nothing is pruned:
+#    • error flows between layers through BOTH the soma AND the dendrite edges,
+#    • the alpha_s / alpha_d / adaptation recurrences and the v-reset are all
+#      backpropagated through time (no e-prop truncation),
+#    • the dendrite path keeps its s'_s·γ·s'_d factor automatically.
+#  The two hard Heaviside thresholds (soma spike o, plateau h) are the only
+#  non-differentiable steps; each gets a surrogate backward via `_spike`
+#  (custom_vjp) using the same 1/(1+β|x|)² slope as the hand rule. Integer
+#  routing (t', the plateau-timing gate, spike-based branch selects) carries
+#  zero gradient, exactly as in exact BPTT-with-surrogate.
+#
+#  Costs O(T) memory (autodiff tapes the whole scan) vs. the hand rule's O(1);
+#  that is the price of the exact gradient and is fine as a reference.
+#
+#  Sign convention: the optimizer does w <- w + lr·g, so we return the ASCENT
+#  direction g = -∇_w loss (a straight negation of the autodiff gradient).
+#  Unlike the hand rule there is NO _SOMA_GRAD_SCALE and NO dropped 1/temp —
+#  this is the un-rescaled true gradient, so the learning rate may need
+#  retuning relative to BPTT_fix.
 #
 #  weights pytree:  {"dend": [w_dend_0..], "soma": [w_soma_0..],
 #                    "readout": w_readout}
@@ -41,26 +50,79 @@ _LOG_EPS = 1e-8
 # ══════════════════════════════════════════════════════════════════════
 
 
-def _forward_and_accum(
-    x_input, weights, alpha_s, alpha_d, alpha_m, tp_list, config, alpha_w,
-    h_carry_init, r_carry_init, C_soma_init, A_dend_init, sum_Er_init,
-    rng_key, dropout_rate,
+@custom_vjp
+def _spike(x, beta):
+    """Heaviside Θ(x) on the forward pass, surrogate slope on the backward.
+
+    Forward value is exactly the hard threshold used by TwoCompNeuron, so the
+    predictions match the int-threshold forward bit-for-bit. beta rides along
+    only to parameterise the surrogate and receives a zero cotangent.
+    """
+    return jnp.where(x >= 0.0, 1.0, 0.0)
+
+
+def _spike_fwd(x, beta):
+    return jnp.where(x >= 0.0, 1.0, 0.0), (x, beta)
+
+
+def _spike_bwd(res, g):
+    x, beta = res
+    return (g * surrogate_sigma(x, beta), jnp.zeros_like(beta))
+
+
+_spike.defvjp(_spike_fwd, _spike_bwd)
+
+
+def _tc_step(state, dend_in, soma_in, t, alpha_s, alpha_d, T_p, config, alpha_w):
+    """Differentiable mirror of TwoCompNeuron.forward_step.
+
+    Identical forward values to two_comp_neuron.forward_step (so _predict_only,
+    which still uses that int-threshold version, agrees), but the two hard
+    thresholds go through `_spike` so autodiff sees a surrogate. h is kept as a
+    float in {0,1}; integer comparisons on it (h_prev == 0/1) are exact and
+    naturally carry no gradient, matching exact BPTT's discrete spike routing.
+    """
+    mu_prev, v_prev, h_prev, tp_prev, matp_prev, w_prev = state
+
+    t_prime = jnp.where(t == 0, 0, jnp.where(h_prev == 1, tp_prev, t))
+    mu = jnp.where(t > 0, alpha_d * mu_prev + (1 - h_prev) * dend_in, dend_in)
+    mu_at_tprime = jnp.where(h_prev == 0, mu, matp_prev)
+
+    plateau_duration = t - t_prime
+    timing_ok = ((plateau_duration <= T_p) & (plateau_duration >= 0)).astype(mu.dtype)
+    # h = 1 iff plateau voltage crosses AND the timing window holds. timing_ok
+    # depends only on integers -> zero gradient; the μ crossing carries the
+    # dendritic surrogate.
+    h = timing_ok * _spike(mu_at_tprime - config.mu_th, config.beta_d)
+
+    v_pre = jnp.where(t > 0, alpha_s * v_prev + soma_in - w_prev, soma_in)
+    o = _spike(v_pre + config.gamma * h - config.v_th, config.beta_s)
+    v = v_pre * (1 - o)
+    w = alpha_w * w_prev + (1 - alpha_w) * config.a_adapt * v_pre + config.b_adapt * o
+
+    new_state = (mu, v, h, t_prime, mu_at_tprime, w)
+    return new_state, o
+
+
+def _init_tc_state(n):
+    """Zero carry for _tc_step: (mu, v, h, t_prime, mu_at_tprime, w_adapt).
+
+    No eligibility slots — autodiff handles temporal credit — and t_prime is the
+    only integer field."""
+    return (
+        jnp.zeros(n), jnp.zeros(n), jnp.zeros(n),
+        jnp.zeros(n, dtype=jnp.int32), jnp.zeros(n), jnp.zeros(n),
+    )
+
+
+def _loss_and_meanv(
+    weights, x_input, alpha_s, alpha_d, alpha_m, tp_list, config, alpha_w,
+    target_smoothed, loss_temperature, loss_count_bias, rng_key, dropout_rate,
 ):
-    """Forward pass + per-layer eligibility accumulation for one sample.
+    """Single differentiable forward: spikes -> LI readout -> softmax CE.
 
-    x_input:      (T, K) input spike train
-    weights:      dict with "dend"/"soma" lists (len L) and "readout"
-    tp_list:      list of L per-neuron plateau-duration arrays
-    h_carry_init: list of L 9-tuples of hidden-neuron state zeros
-    r_carry_init: 3-tuple of readout-neuron state zeros
-    C_soma_init:  list of L (N_l, N_{l-1}) somatic accumulator zeros
-    A_dend_init:  list of L (N_l, N_{l-1}) dendritic accumulator zeros
-    sum_Er_init:  (N_{L-1},) readout-eligibility sum zeros
-    rng_key:      PRNG key for dropout masks
-    dropout_rate: fraction of hidden spikes to drop (0.0 = no dropout)
-
-    Returns: mean_voltage (J,), sum_Er (N_{L-1},),
-             C_soma_list (each N_l,N_{l-1}), A_dend_list (each N_l,N_{l-1})
+    Returns (loss, mean_voltage); mean_voltage is aux (not differentiated).
+    weights is argument 0 so value_and_grad(argnums=0) differentiates it.
     """
     w_dend = weights["dend"]
     w_soma = weights["soma"]
@@ -69,87 +131,77 @@ def _forward_and_accum(
 
     T = x_input.shape[0]
     time_indices = jnp.arange(T, dtype=jnp.int32)
-    # One dropout subkey per (timestep, layer): drop each hidden layer's output.
     dropout_keys = random.split(rng_key, T * L).reshape(T, L, 2)
     dropout_scale = 1.0 / (1.0 - dropout_rate)
 
-    # Only layer 0's synaptic drive can be precomputed (its presynaptic input is
-    # the fixed x_input); deeper layers depend on spikes produced inside the scan.
-    dend_in_0 = x_input @ w_dend[0].T
-    soma_in_0 = x_input @ w_soma[0].T
+    h_states0 = [_init_tc_state(w_dend[l].shape[0]) for l in range(L)]
+    n_out = w_readout.shape[0]
+    r_v0 = jnp.zeros(n_out)      # readout membrane
+    r_sum0 = jnp.zeros(n_out)    # accumulated voltage (for the mean)
 
     def step(carry, inputs):
-        h_states, r_carry, C_soma, A_dend, sum_Er = carry
-        dend_in0_t, soma_in0_t, x_t, t, drop_keys_t = inputs
+        h_states, r_v, r_sum = carry
+        x_t, t, drop_keys_t = inputs
         x_t = x_t.astype(jnp.float64)
 
         new_h_states = list(h_states)
-        new_C_soma = list(C_soma)
-        new_A_dend = list(A_dend)
-
         o_prev = None
         for l in range(L):
-            if l == 0:
-                dend_in_l, soma_in_l = dend_in0_t, soma_in0_t
-                presyn = x_t
-            else:
-                dend_in_l = o_prev @ w_dend[l].T
-                soma_in_l = o_prev @ w_soma[l].T
-                presyn = o_prev
-
-            h_carry, o_l, v_pre_l, h_l, h_prev_l, mu_at_tp_l = TwoCompNeuron.forward_step(
+            presyn = x_t if l == 0 else o_prev
+            dend_in_l = presyn @ w_dend[l].T
+            soma_in_l = presyn @ w_soma[l].T
+            new_h_states[l], o_l = _tc_step(
                 h_states[l], dend_in_l, soma_in_l, t,
                 alpha_s, alpha_d, tp_list[l], config, alpha_w,
             )
-
-            # Local surrogate factors for this layer.
-            sp_l = surrogate_sigma(
-                v_pre_l + config.gamma * h_l - config.v_th, config.beta_s,
-            )
-            hp_l = surrogate_sigma(mu_at_tp_l - config.mu_th, config.beta_d)
-
-            # Update this layer's eligibility traces from its presynaptic signal.
-            (mu_c, v_c, h_c, tp_c, matp_c, E_soma_c,
-             dmu_c, dmu_atp_c, w_c) = h_carry
-            E_soma_new = TwoCompNeuron.update_somatic_eligibility(
-                E_soma_c, presyn, alpha_s,
-            )
-            dmu_new, dmu_atp_new = TwoCompNeuron.update_dendritic_eligibility(
-                dmu_c, dmu_atp_c, presyn, h_prev_l, alpha_d,
-            )
-            new_h_states[l] = (
-                mu_c, v_c, h_c, tp_c, matp_c, E_soma_new, dmu_new, dmu_atp_new, w_c,
-            )
-
-            # Accumulate (N_l, N_{l-1}) tensors; the J-index learning signal is
-            # applied after the scan.
-            new_C_soma[l] = new_C_soma[l] + sp_l[:, None] * E_soma_new[None, :]
-            new_A_dend[l] = new_A_dend[l] + (sp_l * hp_l * config.gamma)[:, None] * dmu_atp_new
-
-            # Dropout this layer's output before it drives the next layer / readout.
-            o_l_float = o_l.astype(jnp.float64)
             mask = random.bernoulli(
                 drop_keys_t[l], 1.0 - dropout_rate, o_l.shape,
             ).astype(jnp.float64)
-            o_prev = o_l_float * mask * dropout_scale
+            o_prev = o_l * mask * dropout_scale  # downstream sees the dropped spike
 
-        # Readout sees the (dropped) output of the last hidden layer.
-        r_carry, r_v, r_E = LINeuron.forward_step(
-            r_carry, o_prev, w_readout, alpha_m,
-        )
-        sum_Er = sum_Er + r_E
+        r_v = alpha_m * r_v + o_prev @ w_readout.T  # LI readout: no threshold/reset
+        r_sum = r_sum + r_v
+        return (new_h_states, r_v, r_sum), None
 
-        new_carry = (new_h_states, r_carry, new_C_soma, new_A_dend, sum_Er)
-        return new_carry, None
+    (_, _, r_sum_f), _ = lax.scan(
+        step, (h_states0, r_v0, r_sum0), (x_input, time_indices, dropout_keys),
+    )
+    mean_voltage = r_sum_f / T
 
-    init_carry = (h_carry_init, r_carry_init, C_soma_init, A_dend_init, sum_Er_init)
-    scan_inputs = (dend_in_0, soma_in_0, x_input, time_indices, dropout_keys)
-    final_carry, _ = lax.scan(step, init_carry, scan_inputs)
+    scaled_logits = mean_voltage / loss_temperature + loss_count_bias
+    probs = jnp.exp(scaled_logits - jnp.max(scaled_logits))
+    probs = probs / jnp.sum(probs)
+    loss = -jnp.sum(target_smoothed * jnp.log(probs + _LOG_EPS))
+    return loss, mean_voltage
 
-    _, r_carry_f, C_soma_f, A_dend_f, sum_Er_f = final_carry
-    mean_voltage = r_carry_f[1] / T  # sum_v / T
 
-    return mean_voltage, sum_Er_f, C_soma_f, A_dend_f
+def _forward_backward(
+    x_input, weights, alpha_s, alpha_d, alpha_m, tp_list, config, alpha_w,
+    h_carry_init, r_carry_init, grad_soma_init, grad_dend_init, sum_Er_init,
+    target_smoothed, loss_temperature, loss_count_bias,
+    rng_key, dropout_rate,
+):
+    """Full surrogate-BPTT gradient for one sample, via reverse-mode autodiff.
+
+    Drop-in for the hand-derived rule: identical signature and returns. The
+    *_init carry/accumulator arguments are unused here (autodiff builds its own
+    tape) but kept so the vmap in_axes and the Network call sites stay unchanged.
+
+    Returns: mean_voltage (J,), loss, prediction,
+             grad_readout, grad_soma_list (each N_l,N_{l-1}), grad_dend_list.
+    """
+    (loss, mean_voltage), grads = value_and_grad(_loss_and_meanv, has_aux=True)(
+        weights, x_input, alpha_s, alpha_d, alpha_m, tp_list, config, alpha_w,
+        target_smoothed, loss_temperature, loss_count_bias, rng_key, dropout_rate,
+    )
+    prediction = jnp.argmax(mean_voltage)
+
+    # Optimizer ascends (w <- w + lr·g); return -∇loss.
+    grad_readout = -grads["readout"]
+    grad_soma_f = [-g for g in grads["soma"]]
+    grad_dend_f = [-g for g in grads["dend"]]
+
+    return mean_voltage, loss, prediction, grad_readout, grad_soma_f, grad_dend_f
 
 
 def _predict_only(
@@ -212,35 +264,6 @@ def _predict_only(
         step, (h_zeros, r_zeros), (dend_in_0, soma_in_0, x_input, time_indices),
     )
     return r_carry_f[1] / T  # mean voltage
-
-
-def _loss_and_grads(
-    mean_voltage, sum_Er, C_soma_list, A_dend_list, B_list,
-    target_smoothed, T, loss_temperature, loss_count_bias,
-):
-    """Compute loss and per-layer DFA weight gradients for one sample."""
-    scaled_logits = mean_voltage / loss_temperature + loss_count_bias
-    probs = jnp.exp(scaled_logits - jnp.max(scaled_logits))
-    probs = probs / jnp.sum(probs)
-
-    prediction = jnp.argmax(mean_voltage)
-    loss = -jnp.sum(target_smoothed * jnp.log(probs + _LOG_EPS))
-    global_error = target_smoothed - probs  # e, shape (J,)
-
-    # Readout: exact gradient (this layer sits directly at the loss).
-    grad_readout = (global_error[:, None] * sum_Er[None, :]) / T
-
-    # Hidden layers: broadcast the error through each layer's fixed random B_l.
-    grad_soma_list = []
-    grad_dend_list = []
-    for C_soma, A_dend, B in zip(C_soma_list, A_dend_list, B_list):
-        L_signal = B.T @ global_error  # (N_l,)
-        grad_soma_list.append(
-            (L_signal[:, None] * C_soma) / (T * _SOMA_GRAD_SCALE)
-        )
-        grad_dend_list.append((L_signal[:, None] * A_dend) / T)
-
-    return loss, prediction, grad_readout, grad_soma_list, grad_dend_list
 
 
 def _apply_grads(weights_flat, grads_flat, lr, clip_value, weight_decay):
@@ -334,18 +357,20 @@ def _activity(
 # ══════════════════════════════════════════════════════════════════════
 #  Pre-compiled versions.
 #
-#  vmap in_axes: x, carry/accumulator inits and the PRNG key are batched
-#  (axis 0); weights, params (alphas/T_p/config) and dropout_rate are shared
-#  (None). Passing weights/params as pytrees lets a single None cover each
-#  whole subtree.
+#  vmap in_axes: x, carry/accumulator inits, targets and the PRNG key are
+#  batched (axis 0); weights, params (alphas/T_p/config), loss scalars and
+#  dropout_rate are shared (None). Passing weights/params as pytrees lets a
+#  single None cover each whole subtree.
 # ══════════════════════════════════════════════════════════════════════
 
-_FWD_AXES = (
+_FB_AXES = (
     0,                                  # x_input
     None,                               # weights (pytree)
     None, None, None,                   # alpha_s, alpha_d, alpha_m
     None, None, None,                   # tp_list, config, alpha_w
-    0, 0, 0, 0, 0,                      # h/r carry inits, C_soma, A_dend, sum_Er
+    0, 0, 0, 0, 0,                      # h/r carry inits, grad_soma, grad_dend, sum_Er
+    0,                                  # target_smoothed
+    None, None,                         # loss_temperature, loss_count_bias
     0,                                  # rng_key
     None,                               # dropout_rate
 )
@@ -356,22 +381,13 @@ _PRED_AXES = (
     None, None, None, None, None, None, # alphas, tp_list, config, alpha_w
 )
 
-_LOSS_AXES = (
-    0, 0, 0, 0,                         # mean_voltage, sum_Er, C_soma, A_dend
-    None,                               # B_list (shared, fixed)
-    0,                                  # target_smoothed
-    None, None, None,                   # T, loss_temperature, loss_count_bias
-)
-
-_fwd_single = jit(_forward_and_accum)
+_fb_single = jit(_forward_backward)
 _pred_single = jit(_predict_only)
-_loss_single = jit(_loss_and_grads)
 _apply = jit(_apply_grads)
 _adam = jit(_adam_apply)
 
-_fwd_batch = jit(vmap(_forward_and_accum, in_axes=_FWD_AXES))
+_fb_batch = jit(vmap(_forward_backward, in_axes=_FB_AXES))
 _pred_batch = jit(vmap(_predict_only, in_axes=_PRED_AXES))
-_loss_batch = jit(vmap(_loss_and_grads, in_axes=_LOSS_AXES))
 _act_batch = jit(vmap(_activity, in_axes=_PRED_AXES))
 
 
@@ -393,7 +409,6 @@ class Network:
         adam_eps: float = 1e-8,
         dropout_rate: float = 0.0,
         weight_decay: float = 0.0,
-        feedback_scale: float = 0.1,
     ):
         self.n_inputs = n_inputs
         self.hidden_sizes = list(hidden_sizes)
@@ -402,25 +417,17 @@ class Network:
         self.optimizer = optimizer
         self.dropout_rate = dropout_rate
         self.weight_decay = weight_decay
-        self.feedback_scale = feedback_scale
         self.n_layers = len(self.hidden_sizes)
 
         # Chain of hidden two-compartment layers: dims [n_inputs, *hidden_sizes].
         dims = [n_inputs] + self.hidden_sizes
-        keys = random.split(key, self.n_layers + 3)
+        keys = random.split(key, self.n_layers + 2)
         self.hidden = [
             TwoCompNeuron(keys[l], self.hidden_sizes[l], dims[l], config)
             for l in range(self.n_layers)
         ]
         self.readout = LINeuron(keys[self.n_layers], n_outputs, self.hidden_sizes[-1], config)
         self.rng_key = keys[self.n_layers + 1]
-
-        # Fixed random feedback matrices B_l (J, N_l), sampled once.
-        fb_keys = random.split(keys[self.n_layers + 2], self.n_layers)
-        self.B = [
-            random.normal(fb_keys[l], (n_outputs, self.hidden_sizes[l])) * feedback_scale
-            for l in range(self.n_layers)
-        ]
 
         if optimizer == "adam":
             self.beta1 = beta1
@@ -502,17 +509,17 @@ class Network:
         return (jnp.zeros(sj), jnp.zeros(sj), jnp.zeros(sn))
 
     def _acc_zeros(self, B=None):
-        """Per-layer (N_l, N_{l-1}) accumulator lists + readout-elig sum vector."""
+        """Per-layer (N_l, N_{l-1}) gradient accumulators + readout-elig sum vector."""
         dims = [self.n_inputs] + self.hidden_sizes
-        C_soma, A_dend = [], []
+        grad_soma, grad_dend = [], []
         for l in range(self.n_layers):
             n, k = self.hidden_sizes[l], dims[l]
             shape = (B, n, k) if B else (n, k)
-            C_soma.append(jnp.zeros(shape))
-            A_dend.append(jnp.zeros(shape))
+            grad_soma.append(jnp.zeros(shape))
+            grad_dend.append(jnp.zeros(shape))
         er_shape = (B, self.hidden_sizes[-1]) if B else (self.hidden_sizes[-1],)
         sum_Er = jnp.zeros(er_shape)
-        return C_soma, A_dend, sum_Er
+        return grad_soma, grad_dend, sum_Er
 
     def _smooth_targets(self, targets):
         cfg = self.config
@@ -549,18 +556,14 @@ class Network:
 
     def train_step(self, x_input, target, lr=1e-3, clip_value=1.0):
         T = x_input.shape[0]
-        C0, A0, Er0 = self._acc_zeros()
+        gs0, gd0, Er0 = self._acc_zeros()
 
-        mean_v, sum_Er, C_soma, A_dend = _fwd_single(
+        mean_v, loss, pred, g_r, g_s_list, g_d_list = _fb_single(
             x_input, self._weights(), *self._params(),
-            self._h_carry(), self._r_carry(), C0, A0, Er0,
-            self._next_key(), self.dropout_rate,
-        )
-
-        loss, pred, g_r, g_s_list, g_d_list = _loss_single(
-            mean_v, sum_Er, C_soma, A_dend, self.B,
-            self._smooth_targets(target), T,
+            self._h_carry(), self._r_carry(), gs0, gd0, Er0,
+            self._smooth_targets(target),
             self.config.loss_temperature, self.config.loss_count_bias,
+            self._next_key(), self.dropout_rate,
         )
 
         gnorms = self._grad_norms(g_d_list, g_s_list, g_r)
@@ -575,20 +578,15 @@ class Network:
 
     def batch_train_step(self, x_batch, targets, lr=1e-3, clip_value=1.0):
         B = x_batch.shape[0]
-        T = x_batch.shape[1]
         batch_keys = random.split(self._next_key(), B)
-        C0, A0, Er0 = self._acc_zeros(B)
+        gs0, gd0, Er0 = self._acc_zeros(B)
 
-        mean_v, sum_Er, C_soma, A_dend = _fwd_batch(
+        mean_v, losses, preds, g_r, g_s_list, g_d_list = _fb_batch(
             x_batch, self._weights(), *self._params(),
-            self._h_carry(B), self._r_carry(B), C0, A0, Er0,
-            batch_keys, self.dropout_rate,
-        )
-
-        losses, preds, g_r, g_s_list, g_d_list = _loss_batch(
-            mean_v, sum_Er, C_soma, A_dend, self.B,
-            self._smooth_targets(targets), T,
+            self._h_carry(B), self._r_carry(B), gs0, gd0, Er0,
+            self._smooth_targets(targets),
             self.config.loss_temperature, self.config.loss_count_bias,
+            batch_keys, self.dropout_rate,
         )
 
         g_r_avg = jnp.mean(g_r, axis=0)
@@ -621,7 +619,6 @@ class Network:
                 "optimizer": self.optimizer,
                 "dropout_rate": float(self.dropout_rate),
                 "weight_decay": float(self.weight_decay),
-                "feedback_scale": float(self.feedback_scale),
             },
             "config": dataclasses.asdict(self.config),
             "extra": extra or {},
@@ -638,7 +635,6 @@ class Network:
             arrays[f"w_dend_{l}"] = np.asarray(h.w_dend)
             arrays[f"w_soma_{l}"] = np.asarray(h.w_soma)
             arrays[f"T_p_{l}"] = np.asarray(h.T_p)
-            arrays[f"B_{l}"] = np.asarray(self.B[l])
         # Shared scalar dynamics (identical across layers).
         h0 = self.hidden[0]
         arrays["alpha_d"] = np.asarray(h0.alpha_d)
@@ -673,7 +669,6 @@ class Network:
             adam_eps=build.get("adam_eps", 1e-8),
             dropout_rate=build["dropout_rate"],
             weight_decay=build["weight_decay"],
-            feedback_scale=build.get("feedback_scale", 0.1),
         )
 
         def arr(k):
@@ -687,7 +682,6 @@ class Network:
             h.alpha_d = arr("alpha_d")
             h.alpha_s = arr("alpha_s")
             h.alpha_w = arr("alpha_w")
-            net.B[l] = arr(f"B_{l}")
         net.readout.alpha_m = arr("alpha_m")
 
         if build["optimizer"] == "adam" and "adam_step" in data.files:

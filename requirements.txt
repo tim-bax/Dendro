@@ -22,3 +22,4 @@ flax==0.12.5
 numpy==2.4.3
 h5py==3.14.0
 tensorflow==2.21.0
+optuna==4.9.0        # DFA/tune_shd.py hyperparameter search only
