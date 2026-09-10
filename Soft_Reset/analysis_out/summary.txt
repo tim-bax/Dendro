@@ -1,0 +1,57 @@
+
+================================================================
+MODEL: shd_seed12_20260909_150601.npz
+================================================================
+
+[1/2] Accuracies ...
+  Train accuracy: 96.84%   (7898/8156)
+  Test  accuracy: 89.80%   (2033/2264)
+
+  Per-digit accuracy (test):
+        0 zero:  94.2%  (n=103)
+         1 one:  94.4%  (n=108)
+         2 two:  75.2%  (n=105)
+       3 three:  87.3%  (n=102)
+        4 four: 100.0%  (n=116)
+        5 five:  86.4%  (n=110)
+         6 six: 100.0%  (n=109)
+       7 seven: 100.0%  (n=109)
+       8 eight:  99.1%  (n=114)
+        9 nine:  90.3%  (n=103)
+          null:  96.7%  (n=122)
+          eins:  98.3%  (n=121)
+          zwei:  86.0%  (n=121)
+          drei:  88.3%  (n=120)
+          vier:  94.8%  (n=115)
+          fünf:  99.1%  (n=112)
+         sechs:  92.4%  (n=118)
+        sieben:  80.2%  (n=121)
+          acht: 100.0%  (n=123)
+          neun:  31.2%  (n=112)
+  -> /net/home/staff/t/tibax/Dokumente/Dendro/Soft_Reset/analysis_out/confusion_matrix.png
+  -> /net/home/staff/t/tibax/Dokumente/Dendro/Soft_Reset/analysis_out/per_digit_accuracy.png
+
+[3]  Mean readout + hidden firing rate ...
+  Mean hidden firing rate (test): 0.2882 (spikes per neuron per timestep)
+    per-neuron rate: min=0.0213  median=0.2687  max=0.8691  dead(<1e-4)=0/512
+  Example test sample #1927: true=drei  pred=drei  p(true)=0.409
+  Mean readout voltage (this example): true-class=-4.677  argmax=-4.677  mean|logit|=12.427
+  -> /net/home/staff/t/tibax/Dokumente/Dendro/Soft_Reset/analysis_out/readout_and_firing_rate.png
+
+[4]  Spike probability inside vs outside a plateau ...
+  Fraction of (neuron,step) in a plateau: 0.4841
+  P(spike | in plateau)     = 0.4855   (47682217/98210469)
+  P(spike | outside plateau)= 0.1031   (10788101/104643931)
+  Ratio (plateau / outside) = 4.71x
+  -> /net/home/staff/t/tibax/Dokumente/Dendro/Soft_Reset/analysis_out/plateau_spike_prob.png
+
+[4b] Per-neuron gain modulation (mean ± std across neurons) ...
+  Neurons with >= 50 plateau steps: 507/512
+  P(spike | outside): mean=0.0785  std=0.0942
+  P(spike | in):      mean=0.4979  std=0.2073
+  Population gain (mean_in/mean_out) = 6.34x   median per-neuron gain = 10.30x
+  -> /net/home/staff/t/tibax/Dokumente/Dendro/Soft_Reset/analysis_out/plateau_gain_modulation.png
+
+[5]  Forward/backward traces for 4 random hidden neurons ...
+  Example test sample #1927 (true=drei, pred=drei); neurons=[137, 156, 260, 323]
+  -> /net/home/staff/t/tibax/Dokumente/Dendro/Soft_Reset/analysis_out/neuron_forward_backward_traces.png

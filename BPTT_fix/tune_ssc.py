@@ -198,7 +198,8 @@ def build_config(args, *, loss_temperature, loss_count_bias, loss_label_smoothin
         tau_plat_min=tau_plat_min, tau_plat_max=tau_plat_max,
         tau_w=args.tau_w, a_adapt=args.a_adapt, b_adapt=args.b_adapt,
         mu_th=args.mu_th, v_th=args.v_th, gamma=gamma,
-        beta_s=beta_s, beta_d=beta_d, weight_scale=weight_scale,
+        beta_s=beta_s, beta_s_dend=beta_s, beta_d=beta_d,  # single-beta tuning
+        weight_scale=weight_scale,
         loss_temperature=loss_temperature, loss_count_bias=loss_count_bias,
         loss_label_smoothing=loss_label_smoothing,
     )

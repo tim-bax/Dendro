@@ -46,22 +46,27 @@ _LOG_EPS = 1e-8
 #  no backprop through the alpha_s membrane recurrence or the reset. Because
 #  pruning removes the cross-layer time coupling and e-prop removes the
 #  within-layer time adjoint, the learning signal is INSTANTANEOUS in t — the
-#  only quantities that come "from the future" are the end-of-sequence error e
-#  and the (precomputable) readout weight rho[t]. So the whole rule is two
+#  only quantity that comes "from the future" is the end-of-sequence error e
+#  (the pure integrator gives a constant, time-independent readout weight; see
+#  below). So the whole rule is two
 #  forward passes: pass 1 gets e, pass 2 re-runs the forward and accumulates
 #  the hand-derived gradients. No autodiff. DFA-level memory (no per-time
 #  tensors are stored).
 #
+#  Readout is a PURE INTEGRATOR (alpha_m = 1, no leak) and the logit is its
+#  FINAL membrane potential U[T] = sum_k W_r o^(L)[k]. Every spike lands in U[T]
+#  with the same weight W_r, so the readout credit is constant in time:
+#  rho[t] ≡ 1 — no geometric-series weighting, no 1/T.
+#
 #  Per-time backbone (ascent-direction, matching w <- w + lr*g):
-#    e           = target - softmax(mean_v/temp + bias)
-#    rho[t]      = (1/T) (1 - alpha_m^(T-t)) / (1 - alpha_m)   # readout weight
-#    do^(L)[t]   = rho[t] (W_r^T e) * mask^L[t]                # readout sees dropped o^L
+#    e           = target - softmax(U/temp + bias)
+#    do^(L)[t]   = (W_r^T e) * mask^L[t]                       # rho[t] ≡ 1; dropped o^L
 #    Lv^(l)[t]   = do^(l)[t] * s'_s^(l)[t]                     # = d(v~)
 #    do^(l-1)[t] = (W_s^(l)^T Lv^(l)[t]) * mask^(l-1)[t]
-#  Grads (no extra /T — it already lives in rho[t]):
+#  Grads:
 #    grad W_s^(l) = sum_t  Lv^(l)[t]                ⊗ E_s^(l)[t]   / _SOMA_GRAD_SCALE
 #    grad W_d^(l) = sum_t (Lv^(l)[t]·γ·s'_d^(l)[t]) ⊗ P̂^(l)[t]
-#    grad W_r     = e ⊗ sum_Er / T                                 (exact, unchanged)
+#    grad W_r     = e ⊗ E_r[T]                                     (E_r[T] = sum_k o^(L)[k])
 #
 #  weights pytree:  {"dend": [w_dend_0..], "soma": [w_soma_0..],
 #                    "readout": w_readout}
@@ -71,18 +76,18 @@ _LOG_EPS = 1e-8
 
 def _forward_backward(
     x_input, weights, alpha_s, alpha_d, alpha_m, tp_list, config, alpha_w,
-    h_carry_init, r_carry_init, grad_soma_init, grad_dend_init, sum_Er_init,
+    h_carry_init, r_carry_init, grad_soma_init, grad_dend_init,
     target_smoothed, loss_temperature, loss_count_bias,
     rng_key, dropout_rate,
 ):
     """Two-pass soma-backbone BPTT for one sample.
 
-    Pass 1: forward (with dropout) -> mean_voltage, sum_Er.
+    Pass 1: forward (with dropout) -> final readout voltage U[T], elig E_r[T].
     Between: e = target - softmax(...), loss, prediction, exact readout grad.
     Pass 2: re-run the forward with the SAME dropout masks; at each step run the
             top-down soma backbone and accumulate the hidden-layer gradients.
 
-    Returns: mean_voltage (J,), loss, prediction,
+    Returns: logits U[T] (J,), loss, prediction,
              grad_readout, grad_soma_list (each N_l,N_{l-1}), grad_dend_list.
     """
     w_dend = weights["dend"]
@@ -126,9 +131,9 @@ def _forward_backward(
         new_state = (mu_c, v_c, h_c, tp_c, matp_c, E_soma_new, dmu_new, dmu_atp_new, w_c)
         return new_state, o_l, sp_l, sp_dend_l, hp_l, E_soma_new, dmu_atp_new
 
-    # ── Pass 1: forward with dropout → readout stats ──────────────────────
+    # ── Pass 1: forward with dropout → final readout voltage + eligibility ─
     def step1(carry, inputs):
-        h_states, r_carry, sum_Er = carry
+        h_states, r_carry = carry
         dend_in0_t, soma_in0_t, x_t, t, drop_keys_t = inputs
         x_t = x_t.astype(jnp.float64)
 
@@ -149,34 +154,31 @@ def _forward_backward(
             ).astype(jnp.float64)
             o_prev = o_l.astype(jnp.float64) * mask * dropout_scale
 
-        r_carry, _, r_E = LINeuron.forward_step(r_carry, o_prev, w_readout, alpha_m)
-        sum_Er = sum_Er + r_E
-        return (new_h_states, r_carry, sum_Er), None
+        r_carry, _, _ = LINeuron.forward_step(r_carry, o_prev, w_readout, alpha_m)
+        return (new_h_states, r_carry), None
 
     scan_inputs = (dend_in_0, soma_in_0, x_input, time_indices, dropout_keys)
-    (_, r_carry_f, sum_Er_f), _ = lax.scan(
-        step1, (h_carry_init, r_carry_init, sum_Er_init), scan_inputs,
+    (_, r_carry_f), _ = lax.scan(
+        step1, (h_carry_init, r_carry_init), scan_inputs,
     )
-    mean_voltage = r_carry_f[1] / T  # sum_v / T
+    logits_v = r_carry_f[0]   # final integrator voltage U[T]
+    E_r_final = r_carry_f[1]  # E_r[T] = sum_k o^(L)[k], the readout eligibility
 
     # ── Loss, error signal, exact readout gradient ────────────────────────
-    scaled_logits = mean_voltage / loss_temperature + loss_count_bias
+    scaled_logits = logits_v / loss_temperature + loss_count_bias
     probs = jnp.exp(scaled_logits - jnp.max(scaled_logits))
     probs = probs / jnp.sum(probs)
-    prediction = jnp.argmax(mean_voltage)
+    prediction = jnp.argmax(logits_v)
     loss = -jnp.sum(target_smoothed * jnp.log(probs + _LOG_EPS))
     e = target_smoothed - probs  # (J,), ascent-direction error
 
-    grad_readout = (e[:, None] * sum_Er_f[None, :]) / T  # exact
+    grad_readout = e[:, None] * E_r_final[None, :]  # exact: e ⊗ E_r[T]
     readout_seed = w_readout.T @ e  # (N_L,), the top of the soma backbone
-
-    # rho[t] = (1/T)(1 - alpha_m^(T-t))/(1 - alpha_m); folds in the readout's 1/T.
-    rho = (1.0 / T) * (1.0 - alpha_m ** (T - time_indices)) / (1.0 - alpha_m)
 
     # ── Pass 2: re-run forward (same dropout) → accumulate hidden grads ────
     def step2(carry, inputs):
         h_states, grad_soma, grad_dend = carry
-        dend_in0_t, soma_in0_t, x_t, t, drop_keys_t, rho_t = inputs
+        dend_in0_t, soma_in0_t, x_t, t, drop_keys_t = inputs
         x_t = x_t.astype(jnp.float64)
 
         new_h_states = list(h_states)
@@ -206,7 +208,7 @@ def _forward_backward(
         Lv = None
         for l in reversed(range(L)):
             if l == L - 1:
-                delta_o = rho_t * readout_seed
+                delta_o = readout_seed          # rho[t] ≡ 1 (pure integrator)
             else:
                 delta_o = w_soma[l + 1].T @ Lv  # W_s^(l+1)^T · d(v~)^(l+1)
             delta_o = delta_o * masks[l]        # downstream sees the dropped spike
@@ -222,19 +224,19 @@ def _forward_backward(
             )
         return (new_h_states, new_grad_soma, new_grad_dend), None
 
-    scan_inputs2 = (dend_in_0, soma_in_0, x_input, time_indices, dropout_keys, rho)
+    scan_inputs2 = (dend_in_0, soma_in_0, x_input, time_indices, dropout_keys)
     (_, grad_soma_f, grad_dend_f), _ = lax.scan(
         step2, (h_carry_init, grad_soma_init, grad_dend_init), scan_inputs2,
     )
     grad_soma_f = [g / _SOMA_GRAD_SCALE for g in grad_soma_f]
 
-    return mean_voltage, loss, prediction, grad_readout, grad_soma_f, grad_dend_f
+    return logits_v, loss, prediction, grad_readout, grad_soma_f, grad_dend_f
 
 
 def _predict_only(
     x_input, weights, alpha_s, alpha_d, alpha_m, tp_list, config, alpha_w,
 ):
-    """Forward pass only — no eligibility bookkeeping. Returns mean_voltage (J,).
+    """Forward pass only — no eligibility bookkeeping. Returns logits U[T] (J,).
 
     Reuses TwoCompNeuron.forward_step (the single definition of the dynamics),
     leaving the three eligibility slots of each carry untouched at zero. No
@@ -286,35 +288,32 @@ def _predict_only(
     h_zeros = [
         _zero_h(w_dend[l].shape[0], w_dend[l].shape[1]) for l in range(L)
     ]
-    r_zeros = (jnp.zeros(n_outputs), jnp.zeros(n_outputs), jnp.zeros(w_dend[-1].shape[0]))
+    r_zeros = (jnp.zeros(n_outputs), jnp.zeros(w_dend[-1].shape[0]))
     (_, r_carry_f), _ = lax.scan(
         step, (h_zeros, r_zeros), (dend_in_0, soma_in_0, x_input, time_indices),
     )
-    return r_carry_f[1] / T  # mean voltage
+    return r_carry_f[0]  # final integrator voltage U[T]
 
 
-def _apply_grads(weights_flat, grads_flat, lr, clip_value, weight_decay):
+def _apply_grads(weights_flat, grads_flat, lr, weight_decay):
     """SGD with decoupled weight decay over a flat list of weight tensors.
 
-    Gradients are clipped first, then w ← w + lr·g − lr·λ·w. For plain SGD the
-    decay term is equivalent to an L2 penalty (λ/2)·||w||² but stays outside the
-    clip so it can't be capped.
+    w ← w + lr·g − lr·λ·w. For plain SGD the decay term is equivalent to an L2
+    penalty (λ/2)·||w||².
     """
     new = []
     for w, g in zip(weights_flat, grads_flat):
-        g = jnp.clip(g, -clip_value, clip_value)
         new.append(w + lr * g - lr * weight_decay * w)
     return new
 
 
 def _adam_apply(
     weights_flat, grads_flat, m_flat, v_flat,
-    step, lr, beta1, beta2, eps, clip_value, weight_decay,
+    step, lr, beta1, beta2, eps, weight_decay,
 ):
     """AdamW-style decoupled weight decay over a flat list of weight tensors."""
     new_w, new_m, new_v = [], [], []
     for w, g, m, v in zip(weights_flat, grads_flat, m_flat, v_flat):
-        g = jnp.clip(g, -clip_value, clip_value)
         m = beta1 * m + (1 - beta1) * g
         v = beta2 * v + (1 - beta2) * g ** 2
         m_hat = m / (1 - beta1 ** step)
@@ -395,7 +394,7 @@ _FB_AXES = (
     None,                               # weights (pytree)
     None, None, None,                   # alpha_s, alpha_d, alpha_m
     None, None, None,                   # tp_list, config, alpha_w
-    0, 0, 0, 0, 0,                      # h/r carry inits, grad_soma, grad_dend, sum_Er
+    0, 0, 0, 0,                         # h/r carry inits, grad_soma, grad_dend
     0,                                  # target_smoothed
     None, None,                         # loss_temperature, loss_count_bias
     0,                                  # rng_key
@@ -533,10 +532,10 @@ class Network:
         j, n = self.n_outputs, self.hidden_sizes[-1]
         sj = (B, j) if B else (j,)
         sn = (B, n) if B else (n,)
-        return (jnp.zeros(sj), jnp.zeros(sj), jnp.zeros(sn))
+        return (jnp.zeros(sj), jnp.zeros(sn))
 
     def _acc_zeros(self, B=None):
-        """Per-layer (N_l, N_{l-1}) gradient accumulators + readout-elig sum vector."""
+        """Per-layer (N_l, N_{l-1}) gradient accumulators."""
         dims = [self.n_inputs] + self.hidden_sizes
         grad_soma, grad_dend = [], []
         for l in range(self.n_layers):
@@ -544,27 +543,25 @@ class Network:
             shape = (B, n, k) if B else (n, k)
             grad_soma.append(jnp.zeros(shape))
             grad_dend.append(jnp.zeros(shape))
-        er_shape = (B, self.hidden_sizes[-1]) if B else (self.hidden_sizes[-1],)
-        sum_Er = jnp.zeros(er_shape)
-        return grad_soma, grad_dend, sum_Er
+        return grad_soma, grad_dend
 
     def _smooth_targets(self, targets):
         cfg = self.config
         one_hot = jnp.eye(self.n_outputs)[targets]
         return one_hot * (1 - cfg.loss_label_smoothing) + cfg.loss_label_smoothing / self.n_outputs
 
-    def _update_weights(self, g_dend_list, g_soma_list, g_readout, lr, clip_value):
+    def _update_weights(self, g_dend_list, g_soma_list, g_readout, lr):
         grads_flat = self._grads_flat(g_dend_list, g_soma_list, g_readout)
         if self.optimizer == "adam":
             self.adam_step = self.adam_step + 1
             new_w, self.m, self.v = _adam(
                 self._weights_flat(), grads_flat, self.m, self.v,
                 self.adam_step, lr, self.beta1, self.beta2, self.adam_eps,
-                clip_value, self.weight_decay,
+                self.weight_decay,
             )
         else:
             new_w = _apply(
-                self._weights_flat(), grads_flat, lr, clip_value, self.weight_decay,
+                self._weights_flat(), grads_flat, lr, self.weight_decay,
             )
         self._set_weights_flat(new_w)
 
@@ -581,36 +578,35 @@ class Network:
 
     # ── Single-sample API ──
 
-    def train_step(self, x_input, target, lr=1e-3, clip_value=1.0):
-        T = x_input.shape[0]
-        gs0, gd0, Er0 = self._acc_zeros()
+    def train_step(self, x_input, target, lr=1e-3):
+        gs0, gd0 = self._acc_zeros()
 
-        mean_v, loss, pred, g_r, g_s_list, g_d_list = _fb_single(
+        logits, loss, pred, g_r, g_s_list, g_d_list = _fb_single(
             x_input, self._weights(), *self._params(),
-            self._h_carry(), self._r_carry(), gs0, gd0, Er0,
+            self._h_carry(), self._r_carry(), gs0, gd0,
             self._smooth_targets(target),
             self.config.loss_temperature, self.config.loss_count_bias,
             self._next_key(), self.dropout_rate,
         )
 
         gnorms = self._grad_norms(g_d_list, g_s_list, g_r)
-        self._update_weights(g_d_list, g_s_list, g_r, lr, clip_value)
+        self._update_weights(g_d_list, g_s_list, g_r, lr)
         return float(loss), int(pred), gnorms
 
     def predict(self, x_input):
-        mean_v = _pred_single(x_input, self._weights(), *self._params())
-        return int(jnp.argmax(mean_v))
+        logits = _pred_single(x_input, self._weights(), *self._params())
+        return int(jnp.argmax(logits))
 
     # ── Batched API ──
 
-    def batch_train_step(self, x_batch, targets, lr=1e-3, clip_value=1.0):
+    def batch_train_step(self, x_batch, targets, lr=1e-3):
         B = x_batch.shape[0]
         batch_keys = random.split(self._next_key(), B)
-        gs0, gd0, Er0 = self._acc_zeros(B)
+        gs0, gd0 = self._acc_zeros(B)
 
-        mean_v, losses, preds, g_r, g_s_list, g_d_list = _fb_batch(
+        logits, losses, preds, g_r, g_s_list, g_d_list = _fb_batch(
             x_batch, self._weights(), *self._params(),
-            self._h_carry(B), self._r_carry(B), gs0, gd0, Er0,
+            self._h_carry(B), self._r_carry(B), gs0, gd0,
             self._smooth_targets(targets),
             self.config.loss_temperature, self.config.loss_count_bias,
             batch_keys, self.dropout_rate,
@@ -621,12 +617,12 @@ class Network:
         g_d_avg = [jnp.mean(g, axis=0) for g in g_d_list]
 
         gnorms = self._grad_norms(g_d_avg, g_s_avg, g_r_avg)
-        self._update_weights(g_d_avg, g_s_avg, g_r_avg, lr, clip_value)
+        self._update_weights(g_d_avg, g_s_avg, g_r_avg, lr)
         return float(jnp.mean(losses)), preds, gnorms
 
     def batch_predict(self, x_batch):
-        mean_v = _pred_batch(x_batch, self._weights(), *self._params())
-        return jnp.argmax(mean_v, axis=1)
+        logits = _pred_batch(x_batch, self._weights(), *self._params())
+        return jnp.argmax(logits, axis=1)
 
     def activity(self, x_batch):
         """Mean firing rate per hidden layer over a batch (no dropout)."""

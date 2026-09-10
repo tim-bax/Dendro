@@ -1,0 +1,67 @@
+{
+  "best_value": 83.98123324396782,
+  "best_params": {
+    "lr": 0.0007896186801026692,
+    "weight_scale": 0.15869086642715013,
+    "loss_temperature": 0.2886496196573106,
+    "loss_count_bias": 0.4744427686266666,
+    "loss_label_smoothing": 0.2896896099223678
+  },
+  "n_trials": 40,
+  "val_speakers": [
+    3,
+    7
+  ],
+  "hidden": [
+    128,
+    128
+  ],
+  "fixed_args": {
+    "n_trials": 40,
+    "epochs": 60,
+    "val_speakers": [
+      3,
+      7
+    ],
+    "progress_every": 5,
+    "storage": "sqlite:///bptt_fix_study.db",
+    "study_name": "bptt_fix_shd",
+    "seed": 42,
+    "out": "",
+    "hidden": [
+      128,
+      128
+    ],
+    "n_outputs": 20,
+    "bin_size_ms": 4.0,
+    "collapse_factor": 5,
+    "max_duration_ms": 700.0,
+    "tau_soma": 15.0,
+    "tau_dend": 15.0,
+    "tau_m": 20.0,
+    "tau_plat_min": 150.0,
+    "tau_plat_max": 500.0,
+    "tau_w": 100.0,
+    "a_adapt": 0.141,
+    "b_adapt": 0.011,
+    "mu_th": 1.0,
+    "v_th": 1.0,
+    "gamma": 0.77,
+    "beta_s": 3.53,
+    "beta_d": 2.63,
+    "dropout": 0.3,
+    "augment_channel_shift": true,
+    "channel_shift_range": 9,
+    "optimizer": "adam",
+    "batch_size": 64,
+    "weight_decay": 0.0,
+    "gradient_clip": 5.0,
+    "beta1": 0.9,
+    "beta2": 0.999,
+    "adam_eps": 1e-08,
+    "lr_patience": 10,
+    "lr_factor": 0.7,
+    "lr_min": 1e-06,
+    "precision": "32"
+  }
+}

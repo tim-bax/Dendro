@@ -73,7 +73,6 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--batch_size", type=int, default=1)
-    p.add_argument("--gradient_clip", type=float, default=5.0)
     p.add_argument("--loss_temperature", type=float, default=2.7)
     p.add_argument("--loss_count_bias", type=float, default=0.18)
     p.add_argument("--loss_label_smoothing", type=float, default=0.13)
@@ -316,7 +315,7 @@ def main():
                 x, y = train_data[int(batch_idx[0])]
                 x = augment_sample(x, args)
                 loss, pred, gnorms = net.train_step(
-                    jnp.array(x), int(y), lr=current_lr, clip_value=args.gradient_clip,
+                    jnp.array(x), int(y), lr=current_lr,
                 )
                 batch_correct = int(pred == int(y))
             else:
@@ -327,7 +326,7 @@ def main():
                 x_batch = jnp.stack(x_batch_np)
                 y_batch = jnp.array([int(train_data[int(i)][1]) for i in batch_idx])
                 loss, preds, gnorms = net.batch_train_step(
-                    x_batch, y_batch, lr=current_lr, clip_value=args.gradient_clip,
+                    x_batch, y_batch, lr=current_lr,
                 )
                 batch_correct = int(jnp.sum(preds == y_batch))
 

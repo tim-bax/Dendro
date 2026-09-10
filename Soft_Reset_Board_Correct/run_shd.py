@@ -1,4 +1,22 @@
 #!/usr/bin/env python3
+"""Train the two-compartment dendritic network on SHD. The only entry point.
+
+    python Original/run_shd.py --help
+
+⚠ The import order in this file is deliberate and load-bearing.
+
+jax_enable_x64 must be set BEFORE jax.numpy is first imported, or it silently has
+no effect. But we only know which precision to ask for after reading the CLI —
+and argparse can't run at import time without duplicating the parser. So argv is
+hand-scanned for --precision first (_precision_from_argv), the JAX flag is set,
+and only then are jax.numpy / network / data imported. That is why the imports
+below sit under executable code and why linters will report E402 here. Do not
+"fix" it by hoisting them.
+
+--precision is consequently parsed twice: once from raw argv, once by argparse
+(which uses the first result as its default). main() cross-checks the two and
+raises if they disagree, which catches passing --precision more than once.
+"""
 import argparse
 import os
 import sys
@@ -8,6 +26,7 @@ import jax
 
 
 def _precision_from_argv(argv):
+    """Scan raw argv for --precision before argparse exists. See module docstring."""
     default = "64"
     for i, arg in enumerate(argv):
         if arg.startswith("--precision="):
@@ -32,7 +51,7 @@ if _ROOT not in sys.path:
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
-from data.ssc_binned import load_ssc_binned, apply_channel_shift
+from data.shd_binned import load_shd_binned, apply_channel_shift
 from config import NeuronConfig
 from network import Network
 
@@ -45,42 +64,32 @@ def augment_sample(x, args):
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="No-history model on SSC (count-bin preprocessing)")
+    p = argparse.ArgumentParser(
+        description="Train two-compartment dendritic neurons on SHD "
+                    "(count-bin preprocessing). These flags are the source of "
+                    "truth for hyperparameters — the defaults in config.py are "
+                    "all overridden from here."
+    )
     p.add_argument("--bin_size_ms", type=float, default=4.0,
                    help="Time bin width in ms (paper default 4.0; also try 10, 14).")
     p.add_argument("--collapse_factor", type=int, default=5,
                    help="Sum-pool every N consecutive input channels (paper default 5: 700 -> 140).")
-    p.add_argument("--max_duration_ms", type=float, default=1000.0,
-                   help="Fixed window length in ms (SSC clips are 1 s; default 1000). "
-                        "Sets T = ceil(max_duration_ms / bin_size_ms).")
-    p.add_argument("--eval_split", choices=["valid", "test"], default="test",
-                   help="SSC evaluation split. Use 'valid' for tuning/model selection "
-                        "and 'test' for the final held-out number (default test).")
-    p.add_argument("--data_path", type=str, default="",
-                   help="Directory holding ssc_{train,valid,test}.h5.gz "
-                        "(default: auto-detect / download).")
-    p.add_argument("--train_samples_per_class", type=int, default=None,
-                   help="Cap training samples per class (SSC is large; useful for quick runs). "
-                        "Default None = use all.")
-    p.add_argument("--eval_samples_per_class", type=int, default=None,
-                   help="Cap eval samples per class. Default None = use all.")
-    p.add_argument("--hidden", type=int, nargs="+", default=[64],
-                   help="Hidden-layer sizes, one per layer. The number of values "
-                        "sets the depth, e.g. --hidden 128 64 32 builds three "
-                        "hidden layers of 128, 64 and 32 two-comp neurons.")
-    p.add_argument("--n_outputs", type=int, default=35)
+    p.add_argument("--max_duration_ms", type=float, default=1400.0,
+                   help="Fixed window length in ms (paper default 1400). Sets T = ceil(max_duration_ms / bin_size_ms).")
+    p.add_argument("--n_hidden", type=int, default=64)
+    p.add_argument("--n_outputs", type=int, default=20)
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--batch_size", type=int, default=1)
-    p.add_argument("--gradient_clip", type=float, default=5.0)
     p.add_argument("--loss_temperature", type=float, default=2.7)
     p.add_argument("--loss_count_bias", type=float, default=0.18)
     p.add_argument("--loss_label_smoothing", type=float, default=0.13)
     p.add_argument("--beta_s", type=float, default=1.0)
     p.add_argument("--beta_s_dend", type=float, default=None,
-                   help="somatic surrogate beta in the dendritic pathway "
-                        "(∂o/∂h). Defaults to --beta_s (single-beta behaviour).")
+                   help="Somatic-surrogate sharpness used in the DENDRITIC gradient "
+                        "path only (the somatic surrogate rides both paths). "
+                        "Defaults to --beta_s, i.e. both paths share one beta.")
     p.add_argument("--beta_d", type=float, default=1.5)
     p.add_argument("--weight_scale", type=float, default=0.25)
     p.add_argument("--tau_soma", type=float, default=15.0,
@@ -126,7 +135,7 @@ def parse_args():
     p.add_argument("--beta2", type=float, default=0.999)
     p.add_argument("--adam_eps", type=float, default=1e-8)
     p.add_argument("--lr_patience", type=int, default=5,
-                   help="ReduceLROnPlateau patience (epochs without eval-acc improvement). "
+                   help="ReduceLROnPlateau patience (epochs without test-acc improvement). "
                         "0 disables scheduling.")
     p.add_argument("--lr_factor", type=float, default=0.7,
                    help="ReduceLROnPlateau multiplier (lr := lr * factor). "
@@ -134,7 +143,7 @@ def parse_args():
     p.add_argument("--lr_min", type=float, default=1e-6,
                    help="LR floor; scheduler will not reduce below this.")
     p.add_argument("--early_stop_patience", type=int, default=0,
-                   help="Stop training if no eval-acc improvement for this many epochs. "
+                   help="Stop training if no test-acc improvement for this many epochs. "
                         "0 disables.")
     p.add_argument(
         "--precision",
@@ -145,7 +154,8 @@ def parse_args():
     p.add_argument("--save_model", type=str, default="",
                    help="Path to write the final trained model (.npz). "
                         "If empty (default), auto-generate "
-                        "no_history/models/ssc_seed{seed}_{timestamp}.npz.")
+                        "Original/models/shd_seed{seed}_{timestamp}.npz "
+                        "(alongside this script).")
     p.add_argument("--no_save_model", action="store_true",
                    help="Disable saving the trained model entirely.")
     return p.parse_args()
@@ -184,30 +194,27 @@ def main():
         )
     if args.channel_shift_range < 0:
         raise ValueError("--channel_shift_range must be >= 0")
+    # Somatic surrogate defaults to one sharpness across both gradient paths.
+    beta_s_dend = args.beta_s if args.beta_s_dend is None else args.beta_s_dend
     np.random.seed(args.seed)
     key = random.PRNGKey(args.seed)
     B = args.batch_size
-    eval_name = args.eval_split
 
-    print("Loading SSC data with count-bin preprocessing...", flush=True)
+    print("Loading SHD data with count-bin preprocessing...", flush=True)
     dtype = np.float64 if args.precision == "64" else np.float32
-    X_tr, y_tr, _, X_ev, y_ev, _ = load_ssc_binned(
+    X_tr, y_tr, _, X_te, y_te, _ = load_shd_binned(
         bin_size_ms=args.bin_size_ms,
         collapse_factor=args.collapse_factor,
         max_duration_ms=args.max_duration_ms,
-        train_samples_per_class=args.train_samples_per_class,
-        eval_samples_per_class=args.eval_samples_per_class,
-        data_path=args.data_path or None,
-        eval_split=eval_name,
         binarize=False,
         dtype=dtype,
     )
     train_data = [(X_tr[i], int(y_tr[i])) for i in range(len(y_tr))]
-    eval_data = [(X_ev[i], int(y_ev[i])) for i in range(len(y_ev))]
+    test_data = [(X_te[i], int(y_te[i])) for i in range(len(y_te))]
     T = train_data[0][0].shape[0]
     n_inputs = train_data[0][0].shape[1]
     print(
-        f"Train: {len(train_data)}  {eval_name.capitalize()}: {len(eval_data)}  "
+        f"Train: {len(train_data)}  Test: {len(test_data)}  "
         f"n_inputs: {n_inputs}  T: {T}  batch_size: {B}  "
         f"precision=float{args.precision}  "
         f"bin={args.bin_size_ms}ms  collapse={args.collapse_factor}",
@@ -228,7 +235,7 @@ def main():
         v_th=args.v_th,
         gamma=args.gamma,
         beta_s=args.beta_s,
-        beta_s_dend=args.beta_s if args.beta_s_dend is None else args.beta_s_dend,
+        beta_s_dend=beta_s_dend,
         beta_d=args.beta_d,
         weight_scale=args.weight_scale,
         loss_temperature=args.loss_temperature,
@@ -249,7 +256,7 @@ def main():
         flush=True,
     )
     net = Network(
-        key, n_inputs, args.hidden, args.n_outputs, config,
+        key, n_inputs, args.n_hidden, args.n_outputs, config,
         optimizer=args.optimizer, beta1=args.beta1, beta2=args.beta2, adam_eps=args.adam_eps,
         dropout_rate=args.dropout, weight_decay=args.weight_decay,
     )
@@ -259,16 +266,15 @@ def main():
     if args.augment_channel_shift:
         chan_shift_str = f"  augment_channel_shift=True(range=±{args.channel_shift_range})"
     wd_str = f"  weight_decay={args.weight_decay}" if args.weight_decay > 0 else ""
-    hidden_str = " -> ".join(f"{n} (2-comp)" for n in args.hidden)
-    arch_str = f"{n_inputs} -> {hidden_str} -> {args.n_outputs} (LI readout)"
+    arch_str = f"{n_inputs} -> {args.n_hidden} (2-comp) -> {args.n_outputs} (LI readout)"
     print(
-        f"Network: {arch_str}  t'-pruned soma-backbone BPTT  "
+        f"Network: {arch_str}  "
         f"optimizer={opt_str}  lr={args.lr}{drop_str}{chan_shift_str}{wd_str}",
         flush=True,
     )
 
-    pre_acc = evaluate(net, eval_data, B)
-    print(f"Pre-training {eval_name} accuracy: {pre_acc:.2f}%", flush=True)
+    pre_acc = evaluate(net, test_data, B)
+    print(f"Pre-training test accuracy: {pre_acc:.2f}%", flush=True)
 
     dev = jax.local_devices()[0]
     if hasattr(dev, "memory_stats") and dev.memory_stats() is not None:
@@ -288,13 +294,13 @@ def main():
     log_interval = 1000
     log_every = max(1, log_interval // B)
 
-    # Fixed diagnostic batch (eval samples, no augmentation) for per-epoch
+    # Fixed diagnostic batch (test samples, no augmentation) for per-epoch
     # firing-rate readout.
-    diag_n = min(len(eval_data), 128)
-    diag_x = jnp.stack([eval_data[i][0] for i in range(diag_n)]) if diag_n else None
+    diag_n = min(len(test_data), 128)
+    diag_x = jnp.stack([test_data[i][0] for i in range(diag_n)]) if diag_n else None
 
     current_lr = args.lr
-    best_eval_acc = 0.0
+    best_test_acc = 0.0
     best_epoch = 0
     epochs_since_lr_drop = 0
     epochs_without_improvement = 0
@@ -316,7 +322,7 @@ def main():
                 x, y = train_data[int(batch_idx[0])]
                 x = augment_sample(x, args)
                 loss, pred, gnorms = net.train_step(
-                    jnp.array(x), int(y), lr=current_lr, clip_value=args.gradient_clip,
+                    jnp.array(x), int(y), lr=current_lr,
                 )
                 batch_correct = int(pred == int(y))
             else:
@@ -327,7 +333,7 @@ def main():
                 x_batch = jnp.stack(x_batch_np)
                 y_batch = jnp.array([int(train_data[int(i)][1]) for i in batch_idx])
                 loss, preds, gnorms = net.batch_train_step(
-                    x_batch, y_batch, lr=current_lr, clip_value=args.gradient_clip,
+                    x_batch, y_batch, lr=current_lr,
                 )
                 batch_correct = int(jnp.sum(preds == y_batch))
 
@@ -362,12 +368,12 @@ def main():
 
         epoch_elapsed = time.time() - epoch_t0
         train_acc = 100.0 * correct / max(samples_per_epoch, 1)
-        eval_acc = evaluate(net, eval_data, B)
+        test_acc = evaluate(net, test_data, B)
         avg_loss = float(np.mean(losses)) if losses else 0.0
 
-        improved = eval_acc > best_eval_acc
+        improved = test_acc > best_test_acc
         if improved:
-            best_eval_acc = eval_acc
+            best_test_acc = test_acc
             best_epoch = epoch
             epochs_since_lr_drop = 0
             epochs_without_improvement = 0
@@ -379,22 +385,17 @@ def main():
 
         print(
             f"Epoch {epoch:03d} | loss={avg_loss:.4f} "
-            f"train_acc={train_acc:.2f}% {eval_name}_acc={eval_acc:.2f}% "
+            f"train_acc={train_acc:.2f}% test_acc={test_acc:.2f}% "
             f"lr={current_lr:.2e} ({epoch_elapsed:.1f}s){marker}",
             flush=True,
         )
 
         # Per-epoch gradient magnitudes (mean over batches) and firing rates.
         if gnorm_count > 0:
-            # Per-layer keys dend0/soma0/dend1/... then readout last.
-            layer_keys = sorted(
-                (k for k in gnorm_sums if k != "readout"),
-                key=lambda k: (int(k[4:]), k[:4]),
-            )
-            key_order = layer_keys + (["readout"] if "readout" in gnorm_sums else [])
+            key_order = ["dend", "soma", "readout"]
             gn_str = "  ".join(
                 f"{k}={gnorm_sums[k] / gnorm_count:.4g}"
-                for k in key_order
+                for k in key_order if k in gnorm_sums
             )
             rate_str = ""
             if diag_x is not None:
@@ -421,10 +422,10 @@ def main():
                   f"{epochs_without_improvement} epochs.", flush=True)
             break
 
-    final_acc = evaluate(net, eval_data, B)
+    final_acc = evaluate(net, test_data, B)
     print(
-        f"\nFinal {eval_name} accuracy: {final_acc:.2f}%  |  "
-        f"Best {eval_name} accuracy: {best_eval_acc:.2f}% (epoch {best_epoch})",
+        f"\nFinal test accuracy: {final_acc:.2f}%  |  "
+        f"Best test accuracy: {best_test_acc:.2f}% (epoch {best_epoch})",
         flush=True,
     )
 
@@ -434,15 +435,14 @@ def main():
         else:
             ts = time.strftime("%Y%m%d_%H%M%S")
             model_path = os.path.join(
-                _SCRIPT_DIR, "models", f"ssc_seed{args.seed}_{ts}.npz"
+                _SCRIPT_DIR, "models", f"shd_seed{args.seed}_{ts}.npz"
             )
         os.makedirs(os.path.dirname(os.path.abspath(model_path)), exist_ok=True)
         net.save(model_path, extra={
             "final_acc": float(final_acc),
-            "best_acc": float(best_eval_acc),
+            "best_acc": float(best_test_acc),
             "best_epoch": int(best_epoch),
             "seed": int(args.seed),
-            "eval_split": eval_name,
             "args": vars(args),
         })
         print(f"Saved trained model -> {model_path}", flush=True)

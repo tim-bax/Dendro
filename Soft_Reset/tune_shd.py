@@ -1,22 +1,32 @@
 #!/usr/bin/env python3
-"""Optuna hyperparameter search for the BPTT_fix (t'-pruned) network on SHD.
+"""Optuna hyperparameter search for the Soft_Reset network on SHD.
 
-SHD counterpart of ``tune_ssc.py``: optimizes the SAME eleven knobs on the
-held-out-SPEAKER VALIDATION accuracy:
+Refit around a strong 512-hidden ROOF-surrogate recipe: the whole biophysics /
+regularization recipe is FROZEN to that run's values (passed on the CLI) and only
+SIX knobs are optimized on the held-out-SPEAKER VALIDATION accuracy:
 
-  Existing 5:  lr, weight_scale, loss_temperature, loss_count_bias,
-               loss_label_smoothing
-  New 6:       gamma, beta_s, beta_d, channel_shift_range,
-               tau_plat_min, tau_plat_max     (tau_plat_max > tau_plat_min)
+  lr, loss_temperature, loss_label_smoothing, gamma,
+  channel_shift_range, tau_plat_max
 
-SHD ships no validation split, so some train SPEAKERS are held out as val (the
-SHD *test* set is never touched during the search). Retrain the winner on ALL
-train speakers with run_shd.py (no --val_speakers) before reporting test.
+Everything else is frozen, notably: weight_scale, mu_th, beta_s, beta_s_dend,
+beta_d, dropout, weight_decay, tau_plat_min, and ``--dend_surrogate_roof`` (the
+flat-roof dendritic gradient — a DIFFERENT gradient path than the default bump, so
+it must be enabled to match the target run). ``loss_count_bias`` is FROZEN to 0.0
+(a scalar added uniformly to all logits, hence a softmax no-op), so it is not
+searched.
 
-Everything else is FROZEN to a fixed recipe (extra neuron biophysics, adaptation,
-dropout, LR-schedule shape) and passed on the CLI.
+SHD ships no validation split, so some train SPEAKERS are held out as val (the SHD
+*test* set is never touched during the search). Retrain the winner on ALL train
+speakers with run_shd.py (no held-out speakers) before reporting test.
 
-    python BPTT_fix/tune_shd.py --precision 32 --n_trials 40 --hidden 128 128
+    python Soft_Reset/tune_shd.py --precision 32 --n_trials 200 --n_hidden 512 \
+      --dend_surrogate_roof --storage sqlite:///Soft_Reset/soft_reset_shd_512.db
+
+Notes (Soft_Reset is a distinct model):
+  * single hidden layer -> ``--n_hidden`` is a scalar int (not a ``--hidden`` list);
+  * no gradient clipping -> ``batch_train_step`` takes no ``clip_value``;
+  * channel-shift augmentation is always applied (its range is a tuned dimension);
+  * tau_plat_max is tuned, tau_plat_min is frozen.
 
 Protocol note: TPE sampler + a light MedianPruner (generous warmup; only clearly
 hopeless trials are stopped).
@@ -61,19 +71,13 @@ from config import NeuronConfig
 from network import Network
 
 
-# ── Search space for the eleven tuned knobs (identical to tune_ssc.py) ────────
+# ── Search space for the six tuned knobs ──────────────────────────────────────
 LR_RANGE = (1e-4, 3e-3)              # log-uniform
-WEIGHT_SCALE_RANGE = (0.1, 1.5)      # log-uniform (Xavier-std multiplier)
 LOSS_TEMPERATURE_RANGE = (0.1, 3.0)  # uniform
-LOSS_COUNT_BIAS_RANGE = (0.0, 0.5)   # uniform
 LABEL_SMOOTHING_RANGE = (0.0, 0.3)   # uniform
-GAMMA_RANGE = (0.5, 0.9)             # uniform (plateau-induced threshold reduction)
-BETA_S_RANGE = (0.3, 4.0)            # uniform (soma surrogate sharpness)
-BETA_D_RANGE = (0.3, 4.0)            # uniform (dend surrogate sharpness)
-CHANNEL_SHIFT_RANGE = (0, 12)        # int; 0 = no channel-shift augmentation
-TAU_PLAT_MIN_RANGE = (50.0, 900.0)   # requested min-knob range
-TAU_PLAT_MAX_RANGE = (200.0, 900.0)  # requested max-knob range
-MIN_PLAT_GAP = 10.0                  # ms; keeps max strictly above min
+GAMMA_RANGE = (0.3, 0.9)             # uniform (plateau-induced threshold reduction)
+CHANNEL_SHIFT_RANGE = (3, 15)        # int-uniform (channel-shift augmentation range)
+TAU_PLAT_MAX_RANGE = (200.0, 700.0)  # uniform (ms; must stay above frozen tau_plat_min)
 
 
 def split_by_speakers(data, speakers, val_ids):
@@ -137,7 +141,7 @@ def evaluate(net, dataset, batch_size=64):
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Optuna tuning for BPTT_fix on SHD (val-driven, light pruning)."
+        description="Optuna tuning for Soft_Reset on SHD (val-driven, light pruning)."
     )
     # ── Search control ──
     p.add_argument("--n_trials", type=int, default=40)
@@ -149,13 +153,13 @@ def parse_args():
     p.add_argument("--progress_every", type=int, default=5,
                    help="Print a per-trial heartbeat every N epochs (0 = off).")
     p.add_argument("--storage", type=str, default="",
-                   help="Optuna storage URL (e.g. sqlite:///bptt_fix_shd.db) "
+                   help="Optuna storage URL (e.g. sqlite:///soft_reset_shd.db) "
                         "for a resumable study. Empty = in-memory.")
-    p.add_argument("--study_name", type=str, default="bptt_fix_shd_128")
-    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--study_name", type=str, default="soft_reset_shd_512")
+    p.add_argument("--seed", type=int, default=12)
     p.add_argument("--out", type=str, default="",
                    help="Where to write best-params JSON. Empty = auto under "
-                        "BPTT_fix/tune_results/.")
+                        "Soft_Reset/tune_results/.")
     # ── Pruning (light by default) ──
     p.add_argument("--pruner", choices=["median", "none"], default="median",
                    help="Light MedianPruner (default) or no pruning.")
@@ -165,54 +169,72 @@ def parse_args():
                    help="MedianPruner: no pruning before this epoch within a trial.")
     p.add_argument("--prune_interval_steps", type=int, default=1)
     # ── Architecture (fixed across the search) ──
-    p.add_argument("--hidden", type=int, nargs="+", default=[128, 128])
+    p.add_argument("--n_hidden", type=int, default=512,
+                   help="Single hidden-layer width (Soft_Reset is one layer).")
     p.add_argument("--n_outputs", type=int, default=20)
     # ── Preprocessing (unified across variants: collapse 5 -> 140 inputs) ──
     p.add_argument("--bin_size_ms", type=float, default=4.0)
     p.add_argument("--collapse_factor", type=int, default=5)
-    p.add_argument("--max_duration_ms", type=float, default=1400.0)
-    # ── Frozen biophysics / recipe (fixed) ──
+    p.add_argument("--max_duration_ms", type=float, default=700.0)
+    # ── Frozen biophysics / recipe (fixed; pinned to the 512-hidden roof run) ──
     p.add_argument("--tau_soma", type=float, default=15.0)
     p.add_argument("--tau_dend", type=float, default=15.0)
     p.add_argument("--tau_m", type=float, default=20.0)
     p.add_argument("--tau_w", type=float, default=100.0)
-    p.add_argument("--a_adapt", type=float, default=0.141,
-                   help="Subthreshold adaptation coupling (fixed; SHD recipe).")
-    p.add_argument("--b_adapt", type=float, default=0.011,
-                   help="Spike-triggered adaptation jump (fixed; SHD recipe).")
-    p.add_argument("--mu_th", type=float, default=1.0)
+    p.add_argument("--a_adapt", type=float, default=0.0,
+                   help="Subthreshold adaptation coupling (fixed; 0.0 = off).")
+    p.add_argument("--b_adapt", type=float, default=0.0,
+                   help="Spike-triggered adaptation jump (fixed; 0.0 = off).")
+    p.add_argument("--tau_plat_min", type=float, default=150.92269413835055,
+                   help="Plateau duration min (fixed; tau_plat_max is searched).")
     p.add_argument("--v_th", type=float, default=1.0)
-    p.add_argument("--dropout", type=float, default=0.3,
+    p.add_argument("--mu_th", type=float, default=1.0,
+                   help="Dendritic plateau threshold (fixed; not searched).")
+    p.add_argument("--weight_scale", type=float, default=0.1,
+                   help="Xavier-std multiplier at init (fixed; not searched).")
+    p.add_argument("--beta_s", type=float, default=10.0,
+                   help="Soma surrogate sharpness, soma path (fixed; not searched).")
+    p.add_argument("--beta_s_dend", type=float, default=10.0,
+                   help="Soma surrogate sharpness, dend path (fixed; not searched). "
+                        "With --dend_surrogate_roof this is the roof's out-of-band decay.")
+    p.add_argument("--beta_d", type=float, default=10.0,
+                   help="Dend surrogate sharpness (fixed; not searched).")
+    p.add_argument("--dend_surrogate_roof", action="store_true",
+                   help="Use the flat-roof dendritic surrogate over [v_th-gamma, v_th] "
+                        "(a distinct gradient path). Enable to match the target run.")
+    p.add_argument("--dropout", type=float, default=0.32,
                    help="Dropout rate (fixed across the search; SHD recipe).")
-    # NOTE: gamma, beta_s, beta_d, tau_plat_min, tau_plat_max, channel_shift_range
-    # are TUNED (see the objective); their run_shd.py defaults are not exposed here.
+    # NOTE: lr, loss_temperature, loss_label_smoothing, gamma, channel_shift_range,
+    # tau_plat_max are TUNED (see the objective). Channel-shift augmentation is
+    # always applied (its range is a tuned dimension). loss_count_bias is FROZEN
+    # to 0.0 in build_config.
     # ── Training (fixed) ──
     p.add_argument("--optimizer", choices=["sgd", "adam"], default="adam")
-    p.add_argument("--batch_size", type=int, default=64)
-    p.add_argument("--weight_decay", type=float, default=0.0)
-    p.add_argument("--gradient_clip", type=float, default=5.0)
+    p.add_argument("--batch_size", type=int, default=16)
+    p.add_argument("--weight_decay", type=float, default=2.6e-6)
     p.add_argument("--beta1", type=float, default=0.9)
     p.add_argument("--beta2", type=float, default=0.999)
     p.add_argument("--adam_eps", type=float, default=1e-8)
     # ── Fixed LR-schedule shape ──
-    p.add_argument("--lr_patience", type=int, default=10)
+    p.add_argument("--lr_patience", type=int, default=9)
     p.add_argument("--lr_factor", type=float, default=0.7)
     p.add_argument("--lr_min", type=float, default=1e-6)
     p.add_argument("--precision", choices=["32", "64"], default=_PRECISION)
     return p.parse_args()
 
 
-def build_config(args, *, loss_temperature, loss_count_bias, loss_label_smoothing,
-                 weight_scale, gamma, beta_s, beta_d, tau_plat_min, tau_plat_max):
+def build_config(args, *, loss_temperature, loss_label_smoothing, gamma,
+                 tau_plat_max):
     return NeuronConfig(
         dt=args.bin_size_ms,
         tau_soma=args.tau_soma, tau_dend=args.tau_dend, tau_m=args.tau_m,
-        tau_plat_min=tau_plat_min, tau_plat_max=tau_plat_max,
+        tau_plat_min=args.tau_plat_min, tau_plat_max=tau_plat_max,  # max tuned
         tau_w=args.tau_w, a_adapt=args.a_adapt, b_adapt=args.b_adapt,
         mu_th=args.mu_th, v_th=args.v_th, gamma=gamma,
-        beta_s=beta_s, beta_s_dend=beta_s, beta_d=beta_d,  # single-beta tuning
-        weight_scale=weight_scale,
-        loss_temperature=loss_temperature, loss_count_bias=loss_count_bias,
+        beta_s=args.beta_s, beta_s_dend=args.beta_s_dend, beta_d=args.beta_d,
+        dend_surrogate_roof=args.dend_surrogate_roof,  # roof path (frozen recipe)
+        weight_scale=args.weight_scale,
+        loss_temperature=loss_temperature, loss_count_bias=0.0,  # frozen no-op
         loss_label_smoothing=loss_label_smoothing,
     )
 
@@ -234,9 +256,7 @@ def train_one_trial(net, train_data, val_data, args, augment_fn, trial):
             batch_idx = idx[bi * B: bi * B + B]
             x_batch = jnp.stack([augment_fn(train_data[int(i)][0]) for i in batch_idx])
             y_batch = jnp.array([int(train_data[int(i)][1]) for i in batch_idx])
-            net.batch_train_step(
-                x_batch, y_batch, lr=current_lr, clip_value=args.gradient_clip,
-            )
+            net.batch_train_step(x_batch, y_batch, lr=current_lr)
 
         val_acc = evaluate(net, val_data, B)
         improved = val_acc > best_val_acc
@@ -308,9 +328,8 @@ def main():
     else:
         print(f"Device: {dev} (no memory stats available)", flush=True)
 
-    hidden_str = "-".join(str(h) for h in args.hidden)
     print(
-        f"Search: {n_inputs} -> {hidden_str} -> {args.n_outputs}  T={T}  "
+        f"Search: {n_inputs} -> {args.n_hidden} -> {args.n_outputs}  T={T}  "
         f"val_speakers={sorted(args.val_speakers)} "
         f"(val N={len(val_data)}, train N={len(train_data)})  "
         f"trials={args.n_trials}  epochs/trial={args.epochs}  "
@@ -318,17 +337,20 @@ def main():
         flush=True,
     )
     print(
-        "Tuned: lr weight_scale loss_temperature loss_count_bias "
-        "loss_label_smoothing gamma beta_s beta_d channel_shift_range "
-        "tau_plat_min tau_plat_max",
+        "Tuned: lr loss_temperature loss_label_smoothing gamma "
+        "channel_shift_range tau_plat_max",
         flush=True,
     )
     print(
         "Frozen recipe: "
+        f"loss_count_bias=0.0 (no-op) weight_scale={args.weight_scale} "
+        f"mu_th={args.mu_th} beta_s={args.beta_s} beta_s_dend={args.beta_s_dend} "
+        f"beta_d={args.beta_d} dend_surrogate_roof={args.dend_surrogate_roof} "
         f"tau_soma={args.tau_soma} tau_dend={args.tau_dend} tau_m={args.tau_m} "
         f"tau_w={args.tau_w} a_adapt={args.a_adapt} b_adapt={args.b_adapt} "
-        f"mu_th={args.mu_th} v_th={args.v_th} dropout={args.dropout} "
-        f"weight_decay={args.weight_decay} "
+        f"tau_plat_min={args.tau_plat_min} (max in {TAU_PLAT_MAX_RANGE}) v_th={args.v_th} "
+        f"dropout={args.dropout} weight_decay={args.weight_decay} "
+        f"channel_shift=tuned{CHANNEL_SHIFT_RANGE} "
         f"lr_patience={args.lr_patience} lr_factor={args.lr_factor}",
         flush=True,
     )
@@ -338,51 +360,38 @@ def main():
         np.random.seed(args.seed + trial.number)
 
         lr = trial.suggest_float("lr", *LR_RANGE, log=True)
-        weight_scale = trial.suggest_float("weight_scale", *WEIGHT_SCALE_RANGE, log=True)
         loss_temperature = trial.suggest_float("loss_temperature", *LOSS_TEMPERATURE_RANGE)
-        loss_count_bias = trial.suggest_float("loss_count_bias", *LOSS_COUNT_BIAS_RANGE)
         loss_label_smoothing = trial.suggest_float(
             "loss_label_smoothing", *LABEL_SMOOTHING_RANGE)
         gamma = trial.suggest_float("gamma", *GAMMA_RANGE)
-        beta_s = trial.suggest_float("beta_s", *BETA_S_RANGE)
-        beta_d = trial.suggest_float("beta_d", *BETA_D_RANGE)
-        channel_shift_range = trial.suggest_int("channel_shift_range", *CHANNEL_SHIFT_RANGE)
-
-        # Plateau window: sample min, then max with a dynamic lower bound so that
-        # tau_plat_max > tau_plat_min is guaranteed (min in [50,900], max in [200,900]).
-        tau_plat_min = trial.suggest_float(
-            "tau_plat_min", TAU_PLAT_MIN_RANGE[0], TAU_PLAT_MIN_RANGE[1] - MIN_PLAT_GAP)
-        lo_max = min(max(TAU_PLAT_MAX_RANGE[0], tau_plat_min + MIN_PLAT_GAP),
-                     TAU_PLAT_MAX_RANGE[1])
-        tau_plat_max = trial.suggest_float("tau_plat_max", lo_max, TAU_PLAT_MAX_RANGE[1])
+        channel_shift = trial.suggest_int("channel_shift_range", *CHANNEL_SHIFT_RANGE)
+        tau_plat_max = trial.suggest_float("tau_plat_max", *TAU_PLAT_MAX_RANGE)
 
         print(
             f"[trial {trial.number:3d}] start: lr={lr:.2e} "
-            f"weight_scale={weight_scale:.3f} temp={loss_temperature:.3f} "
-            f"count_bias={loss_count_bias:.3f} smooth={loss_label_smoothing:.3f} "
-            f"gamma={gamma:.3f} beta_s={beta_s:.3f} beta_d={beta_d:.3f} "
-            f"chan_shift={channel_shift_range} "
-            f"tau_plat=[{tau_plat_min:.1f}, {tau_plat_max:.1f}]ms",
+            f"temp={loss_temperature:.3f} smooth={loss_label_smoothing:.3f} "
+            f"gamma={gamma:.3f} channel_shift={channel_shift:d} "
+            f"tau_plat_max={tau_plat_max:.1f}",
             flush=True,
         )
 
         config = build_config(
-            args, loss_temperature=loss_temperature, loss_count_bias=loss_count_bias,
-            loss_label_smoothing=loss_label_smoothing, weight_scale=weight_scale,
-            gamma=gamma, beta_s=beta_s, beta_d=beta_d,
-            tau_plat_min=tau_plat_min, tau_plat_max=tau_plat_max,
+            args, loss_temperature=loss_temperature,
+            loss_label_smoothing=loss_label_smoothing,
+            gamma=gamma, tau_plat_max=tau_plat_max,
         )
         key = random.fold_in(base_key, trial.number)
         net = Network(
-            key, n_inputs, args.hidden, args.n_outputs, config,
+            key, n_inputs, args.n_hidden, args.n_outputs, config,
             optimizer=args.optimizer, beta1=args.beta1, beta2=args.beta2,
             adam_eps=args.adam_eps, dropout_rate=args.dropout,
             weight_decay=args.weight_decay,
         )
 
         def augment_fn(x):
-            # channel_shift_range == 0 -> apply_channel_shift is a no-op.
-            return apply_channel_shift(x, channel_shift_range)
+            # Channel-shift range is a tuned dimension, so always apply it (only to
+            # train inputs; eval stays un-augmented).
+            return apply_channel_shift(x, channel_shift)
 
         args.lr_current = lr  # starting lr for this trial's schedule
         return train_one_trial(net, train_data, val_data, args, augment_fn, trial)
@@ -423,39 +432,37 @@ def main():
             "best_params": study.best_params,
             "n_trials": len(study.trials),
             "val_speakers": sorted(args.val_speakers),
-            "hidden": list(args.hidden),
+            "n_hidden": args.n_hidden,
             "fixed_args": {k: v for k, v in vars(args).items() if k != "lr_current"},
         }, f, indent=2)
     print(f"Wrote best params -> {out}", flush=True)
 
     # Ready-to-run retrain command (on ALL train speakers) with the winner.
     bp = study.best_params
-    cs = int(bp["channel_shift_range"])
-    chan_shift_flag = (
-        f"--augment_channel_shift --channel_shift_range {cs} " if cs > 0 else ""
-    )
+    roof_flag = "--dend_surrogate_roof " if args.dend_surrogate_roof else ""
     print(
         "\nRetrain the winner on ALL speakers, then report test:\n"
-        f"  python BPTT_fix/run_shd.py --hidden {hidden_str.replace('-', ' ')} "
+        f"  python Soft_Reset/run_shd.py --n_hidden {args.n_hidden} "
         f"--n_outputs {args.n_outputs} "
         f"--optimizer {args.optimizer} --precision {args.precision} "
         f"--batch_size {args.batch_size} --epochs {args.epochs} "
         f"--bin_size_ms {args.bin_size_ms} --collapse_factor {args.collapse_factor} "
         f"--max_duration_ms {args.max_duration_ms} "
-        f"--lr {bp['lr']:.6g} --weight_scale {bp['weight_scale']:.4g} "
+        f"--lr {bp['lr']:.6g} --weight_scale {args.weight_scale:.4g} "
         f"--loss_temperature {bp['loss_temperature']:.4g} "
-        f"--loss_count_bias {bp['loss_count_bias']:.4g} "
+        f"--loss_count_bias 0 "
         f"--loss_label_smoothing {bp['loss_label_smoothing']:.4g} "
-        f"--gamma {bp['gamma']:.4g} --beta_s {bp['beta_s']:.4g} "
-        f"--beta_d {bp['beta_d']:.4g} "
-        f"--tau_plat_min {bp['tau_plat_min']:.4g} "
-        f"--tau_plat_max {bp['tau_plat_max']:.4g} "
-        f"--mu_th {args.mu_th} --v_th {args.v_th} --tau_w {args.tau_w} "
+        f"--gamma {bp['gamma']:.4g} --mu_th {args.mu_th:.4g} "
+        f"--beta_s {args.beta_s:.4g} --beta_s_dend {args.beta_s_dend:.4g} "
+        f"--beta_d {args.beta_d:.4g} {roof_flag}"
+        f"--tau_plat_min {args.tau_plat_min} --tau_plat_max {bp['tau_plat_max']:.6g} "
+        f"--v_th {args.v_th} --tau_w {args.tau_w} "
         f"--a_adapt {args.a_adapt} --b_adapt {args.b_adapt} "
         f"--tau_soma {args.tau_soma} --tau_dend {args.tau_dend} --tau_m {args.tau_m} "
-        f"--dropout {args.dropout} "
-        f"{chan_shift_flag}"
-        f"--lr_patience {args.lr_patience} --lr_factor {args.lr_factor}",
+        f"--dropout {args.dropout} --weight_decay {args.weight_decay} "
+        f"--augment_channel_shift --channel_shift_range {bp['channel_shift_range']} "
+        f"--lr_patience {args.lr_patience} --lr_factor {args.lr_factor} "
+        f"--lr_min {args.lr_min} --seed {args.seed}",
         flush=True,
     )
 

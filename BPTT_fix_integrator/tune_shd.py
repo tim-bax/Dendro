@@ -190,7 +190,6 @@ def parse_args():
     p.add_argument("--optimizer", choices=["sgd", "adam"], default="adam")
     p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--weight_decay", type=float, default=0.0)
-    p.add_argument("--gradient_clip", type=float, default=5.0)
     p.add_argument("--beta1", type=float, default=0.9)
     p.add_argument("--beta2", type=float, default=0.999)
     p.add_argument("--adam_eps", type=float, default=1e-8)
@@ -235,7 +234,7 @@ def train_one_trial(net, train_data, val_data, args, augment_fn, trial):
             x_batch = jnp.stack([augment_fn(train_data[int(i)][0]) for i in batch_idx])
             y_batch = jnp.array([int(train_data[int(i)][1]) for i in batch_idx])
             net.batch_train_step(
-                x_batch, y_batch, lr=current_lr, clip_value=args.gradient_clip,
+                x_batch, y_batch, lr=current_lr,
             )
 
         val_acc = evaluate(net, val_data, B)

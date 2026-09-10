@@ -66,6 +66,9 @@ def parse_args():
     p.add_argument("--loss_count_bias", type=float, default=0.18)
     p.add_argument("--loss_label_smoothing", type=float, default=0.13)
     p.add_argument("--beta_s", type=float, default=1.0)
+    p.add_argument("--beta_s_dend", type=float, default=None,
+                   help="somatic surrogate beta in the dendritic pathway "
+                        "(∂o/∂h). Defaults to --beta_s (single-beta behaviour).")
     p.add_argument("--beta_d", type=float, default=1.5)
     p.add_argument("--weight_scale", type=float, default=0.25)
     p.add_argument("--tau_soma", type=float, default=15.0,
@@ -208,6 +211,7 @@ def main():
         v_th=args.v_th,
         gamma=args.gamma,
         beta_s=args.beta_s,
+        beta_s_dend=args.beta_s if args.beta_s_dend is None else args.beta_s_dend,
         beta_d=args.beta_d,
         weight_scale=args.weight_scale,
         loss_temperature=args.loss_temperature,

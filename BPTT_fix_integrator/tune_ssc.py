@@ -1,25 +1,28 @@
 #!/usr/bin/env python3
-"""Optuna hyperparameter search for the BPTT_fix (t'-pruned) network on SHD.
+"""Optuna hyperparameter search for the BPTT_fix (t'-pruned) network on SSC.
 
-SHD counterpart of ``tune_ssc.py``: optimizes the SAME eleven knobs on the
-held-out-SPEAKER VALIDATION accuracy:
+Optimizes the held-out VALIDATION accuracy over eleven knobs:
 
-  Existing 5:  lr, weight_scale, loss_temperature, loss_count_bias,
-               loss_label_smoothing
-  New 6:       gamma, beta_s, beta_d, channel_shift_range,
-               tau_plat_min, tau_plat_max     (tau_plat_max > tau_plat_min)
+  Existing 5 (as in tune_shd.py):
+      lr, weight_scale, loss_temperature, loss_count_bias, loss_label_smoothing
+  New 6 (requested):
+      gamma, beta_s, beta_d, channel_shift_range,
+      tau_plat_min, tau_plat_max            (with tau_plat_max > tau_plat_min)
 
-SHD ships no validation split, so some train SPEAKERS are held out as val (the
-SHD *test* set is never touched during the search). Retrain the winner on ALL
-train speakers with run_shd.py (no --val_speakers) before reporting test.
+Unlike SHD, SSC ships a dedicated ``valid`` split, so model selection uses it
+directly (no speaker holdout). The SSC ``test`` split is never touched during the
+search: retrain the winner on train with run_scc.py (which reports test) using the
+command printed at the end.
 
-Everything else is FROZEN to a fixed recipe (extra neuron biophysics, adaptation,
-dropout, LR-schedule shape) and passed on the CLI.
+Everything not listed above is FROZEN to a fixed recipe (extra neuron biophysics,
+adaptation, LR-schedule shape, architecture, preprocessing) and passed on the CLI.
+The frozen biophysics default to run_scc.py's own defaults (adaptation OFF); pass
+e.g. --a_adapt 0.141 --b_adapt 0.011 to reuse the SHD adaptation recipe.
 
-    python BPTT_fix/tune_shd.py --precision 32 --n_trials 40 --hidden 128 128
+    python BPTT_fix/tune_ssc.py --precision 32 --n_trials 40
 
 Protocol note: TPE sampler + a light MedianPruner (generous warmup; only clearly
-hopeless trials are stopped).
+hopeless trials are stopped). The 128x128 network is the default (--hidden 128 128).
 """
 import argparse
 import json
@@ -56,12 +59,13 @@ if _ROOT not in sys.path:
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
-from data.shd_binned import load_shd_binned, apply_channel_shift
+from data.ssc_binned import load_ssc_binned, apply_channel_shift
 from config import NeuronConfig
 from network import Network
 
 
-# ── Search space for the eleven tuned knobs (identical to tune_ssc.py) ────────
+# ── Search space for the eleven tuned knobs ──────────────────────────────────
+# Edit these bounds to widen/narrow the search. lr bounds are set for Adam.
 LR_RANGE = (1e-4, 3e-3)              # log-uniform
 WEIGHT_SCALE_RANGE = (0.1, 1.5)      # log-uniform (Xavier-std multiplier)
 LOSS_TEMPERATURE_RANGE = (0.1, 3.0)  # uniform
@@ -71,35 +75,11 @@ GAMMA_RANGE = (0.5, 0.9)             # uniform (plateau-induced threshold reduct
 BETA_S_RANGE = (0.3, 4.0)            # uniform (soma surrogate sharpness)
 BETA_D_RANGE = (0.3, 4.0)            # uniform (dend surrogate sharpness)
 CHANNEL_SHIFT_RANGE = (0, 12)        # int; 0 = no channel-shift augmentation
+# Plateau duration (physical ms). The max lower bound is dynamic (see objective)
+# so that tau_plat_max > tau_plat_min is guaranteed every trial.
 TAU_PLAT_MIN_RANGE = (50.0, 900.0)   # requested min-knob range
 TAU_PLAT_MAX_RANGE = (200.0, 900.0)  # requested max-knob range
 MIN_PLAT_GAP = 10.0                  # ms; keeps max strictly above min
-
-
-def split_by_speakers(data, speakers, val_ids):
-    """Partition a train list into (train, val) by held-out speaker id."""
-    speakers = np.asarray(speakers)
-    val_set = set(int(s) for s in val_ids)
-    present = set(int(s) for s in np.unique(speakers))
-    missing = val_set - present
-    if missing:
-        raise ValueError(
-            f"--val_speakers {sorted(missing)} not present in the train split "
-            f"(train speakers: {sorted(present)})."
-        )
-    train_data, val_data = [], []
-    for sample, spk in zip(data, speakers):
-        (val_data if int(spk) in val_set else train_data).append(sample)
-    train_classes = {int(y) for _, y in train_data}
-    all_classes = {int(y) for _, y in data}
-    dropped = all_classes - train_classes
-    if dropped:
-        print(
-            f"WARNING: holding out speakers {sorted(val_set)} removes classes "
-            f"{sorted(dropped)} from the train split.",
-            flush=True,
-        )
-    return train_data, val_data
 
 
 def build_pruner(args):
@@ -137,25 +117,15 @@ def evaluate(net, dataset, batch_size=64):
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Optuna tuning for BPTT_fix on SHD (val-driven, light pruning)."
+        description="Optuna tuning for BPTT_fix on SSC (val-driven, light pruning)."
     )
     # ── Search control ──
     p.add_argument("--n_trials", type=int, default=40)
     p.add_argument("--epochs", type=int, default=60,
                    help="Per-trial epoch budget. Trials run to the full count "
                         "unless truncated by the (light) MedianPruner.")
-    p.add_argument("--val_speakers", type=int, nargs="+", default=[3, 7],
-                   help="Speaker ids held out of train as the val set (>=1).")
     p.add_argument("--progress_every", type=int, default=5,
                    help="Print a per-trial heartbeat every N epochs (0 = off).")
-    p.add_argument("--storage", type=str, default="",
-                   help="Optuna storage URL (e.g. sqlite:///bptt_fix_shd.db) "
-                        "for a resumable study. Empty = in-memory.")
-    p.add_argument("--study_name", type=str, default="bptt_fix_shd_128")
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--out", type=str, default="",
-                   help="Where to write best-params JSON. Empty = auto under "
-                        "BPTT_fix/tune_results/.")
     # ── Pruning (light by default) ──
     p.add_argument("--pruner", choices=["median", "none"], default="median",
                    help="Light MedianPruner (default) or no pruning.")
@@ -164,33 +134,50 @@ def parse_args():
     p.add_argument("--prune_warmup_steps", type=int, default=20,
                    help="MedianPruner: no pruning before this epoch within a trial.")
     p.add_argument("--prune_interval_steps", type=int, default=1)
+    p.add_argument("--storage", type=str, default="",
+                   help="Optuna storage URL (e.g. sqlite:///bptt_fix_ssc.db) "
+                        "for a resumable study. Empty = in-memory.")
+    p.add_argument("--study_name", type=str, default="bptt_fix_ssc_128")
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--out", type=str, default="",
+                   help="Where to write best-params JSON. Empty = auto under "
+                        "BPTT_fix/tune_results/.")
     # ── Architecture (fixed across the search) ──
     p.add_argument("--hidden", type=int, nargs="+", default=[128, 128])
-    p.add_argument("--n_outputs", type=int, default=20)
-    # ── Preprocessing (unified across variants: collapse 5 -> 140 inputs) ──
+    p.add_argument("--n_outputs", type=int, default=35)
+    # ── Preprocessing (fixed; run_scc.py defaults) ──
     p.add_argument("--bin_size_ms", type=float, default=4.0)
     p.add_argument("--collapse_factor", type=int, default=5)
-    p.add_argument("--max_duration_ms", type=float, default=1400.0)
-    # ── Frozen biophysics / recipe (fixed) ──
+    p.add_argument("--max_duration_ms", type=float, default=1000.0)
+    p.add_argument("--data_path", type=str, default="",
+                   help="Directory holding ssc_{train,valid,test}.h5.gz "
+                        "(default: auto-detect / download).")
+    p.add_argument("--train_samples_per_class", type=int, default=None,
+                   help="Cap training samples per class (useful for quick runs).")
+    p.add_argument("--eval_samples_per_class", type=int, default=None,
+                   help="Cap validation samples per class.")
+    # ── Frozen biophysics (fixed; default to run_scc.py values) ──
     p.add_argument("--tau_soma", type=float, default=15.0)
     p.add_argument("--tau_dend", type=float, default=15.0)
     p.add_argument("--tau_m", type=float, default=20.0)
     p.add_argument("--tau_w", type=float, default=100.0)
-    p.add_argument("--a_adapt", type=float, default=0.141,
-                   help="Subthreshold adaptation coupling (fixed; SHD recipe).")
-    p.add_argument("--b_adapt", type=float, default=0.011,
-                   help="Spike-triggered adaptation jump (fixed; SHD recipe).")
+    p.add_argument("--a_adapt", type=float, default=0.0,
+                   help="Subthreshold adaptation coupling (default 0.0 = off; "
+                        "pass 0.141 to reuse the SHD recipe).")
+    p.add_argument("--b_adapt", type=float, default=0.0,
+                   help="Spike-triggered adaptation jump (default 0.0 = off; "
+                        "pass 0.011 to reuse the SHD recipe).")
     p.add_argument("--mu_th", type=float, default=1.0)
     p.add_argument("--v_th", type=float, default=1.0)
-    p.add_argument("--dropout", type=float, default=0.3,
-                   help="Dropout rate (fixed across the search; SHD recipe).")
-    # NOTE: gamma, beta_s, beta_d, tau_plat_min, tau_plat_max, channel_shift_range
-    # are TUNED (see the objective); their run_shd.py defaults are not exposed here.
+    # NOTE: gamma, beta_s, beta_d, tau_plat_min, tau_plat_max are TUNED (see
+    # the objective); their run_scc.py defaults are intentionally not exposed here.
     # ── Training (fixed) ──
     p.add_argument("--optimizer", choices=["sgd", "adam"], default="adam")
     p.add_argument("--batch_size", type=int, default=64)
-    p.add_argument("--weight_decay", type=float, default=0.0)
-    p.add_argument("--gradient_clip", type=float, default=5.0)
+    p.add_argument("--weight_decay", type=float, default=0.0,
+                   help="Decoupled weight decay (fixed across the search).")
+    p.add_argument("--dropout", type=float, default=0.0,
+                   help="Dropout rate (fixed across the search).")
     p.add_argument("--beta1", type=float, default=0.9)
     p.add_argument("--beta2", type=float, default=0.999)
     p.add_argument("--adam_eps", type=float, default=1e-8)
@@ -235,7 +222,7 @@ def train_one_trial(net, train_data, val_data, args, augment_fn, trial):
             x_batch = jnp.stack([augment_fn(train_data[int(i)][0]) for i in batch_idx])
             y_batch = jnp.array([int(train_data[int(i)][1]) for i in batch_idx])
             net.batch_train_step(
-                x_batch, y_batch, lr=current_lr, clip_value=args.gradient_clip,
+                x_batch, y_batch, lr=current_lr,
             )
 
         val_acc = evaluate(net, val_data, B)
@@ -280,21 +267,27 @@ def main():
         )
 
     dtype = np.float64 if args.precision == "64" else np.float32
-    print(f"Loading SHD once (precision=float{args.precision})...", flush=True)
-    X_tr, y_tr, _, X_te, y_te, _, spk_tr, _ = load_shd_binned(
+    print(f"Loading SSC once (precision=float{args.precision})...", flush=True)
+    X_tr, y_tr, _, X_va, y_va, _ = load_ssc_binned(
         bin_size_ms=args.bin_size_ms,
         collapse_factor=args.collapse_factor,
         max_duration_ms=args.max_duration_ms,
-        binarize=False, dtype=dtype, return_speakers=True,
+        train_samples_per_class=args.train_samples_per_class,
+        eval_samples_per_class=args.eval_samples_per_class,
+        data_path=args.data_path or None,
+        eval_split="valid",  # selection on the dedicated valid split; never test
+        binarize=False,
+        dtype=dtype,
     )
-    all_train = [(X_tr[i], int(y_tr[i])) for i in range(len(y_tr))]
-    train_data, val_data = split_by_speakers(all_train, spk_tr, args.val_speakers)
+    train_data = [(X_tr[i], int(y_tr[i])) for i in range(len(y_tr))]
+    val_data = [(X_va[i], int(y_va[i])) for i in range(len(y_va))]
     n_inputs = train_data[0][0].shape[1]
     T = train_data[0][0].shape[0]
     base_key = random.PRNGKey(args.seed)
 
     # Report the JAX backend/device up front so it's unambiguous whether the
-    # search is on GPU.
+    # search is on GPU. The "Could not get kernel mode driver version" line XLA
+    # prints on some driver strings is only a warning, not a CPU fallback.
     dev = jax.local_devices()[0]
     print(f"JAX backend: {jax.default_backend()}  devices: {jax.devices()}", flush=True)
     if hasattr(dev, "memory_stats") and dev.memory_stats() is not None:
@@ -311,8 +304,7 @@ def main():
     hidden_str = "-".join(str(h) for h in args.hidden)
     print(
         f"Search: {n_inputs} -> {hidden_str} -> {args.n_outputs}  T={T}  "
-        f"val_speakers={sorted(args.val_speakers)} "
-        f"(val N={len(val_data)}, train N={len(train_data)})  "
+        f"(valid N={len(val_data)}, train N={len(train_data)})  "
         f"trials={args.n_trials}  epochs/trial={args.epochs}  "
         f"opt={args.optimizer}  bs={args.batch_size}  pruner={args.pruner}",
         flush=True,
@@ -349,7 +341,8 @@ def main():
         channel_shift_range = trial.suggest_int("channel_shift_range", *CHANNEL_SHIFT_RANGE)
 
         # Plateau window: sample min, then max with a dynamic lower bound so that
-        # tau_plat_max > tau_plat_min is guaranteed (min in [50,900], max in [200,900]).
+        # tau_plat_max > tau_plat_min is guaranteed while both stay in their
+        # requested ranges (min in [50,900], max in [200,900]).
         tau_plat_min = trial.suggest_float(
             "tau_plat_min", TAU_PLAT_MIN_RANGE[0], TAU_PLAT_MIN_RANGE[1] - MIN_PLAT_GAP)
         lo_max = min(max(TAU_PLAT_MAX_RANGE[0], tau_plat_min + MIN_PLAT_GAP),
@@ -422,26 +415,26 @@ def main():
             "best_value": study.best_value,
             "best_params": study.best_params,
             "n_trials": len(study.trials),
-            "val_speakers": sorted(args.val_speakers),
+            "eval_split": "valid",
             "hidden": list(args.hidden),
             "fixed_args": {k: v for k, v in vars(args).items() if k != "lr_current"},
         }, f, indent=2)
     print(f"Wrote best params -> {out}", flush=True)
 
-    # Ready-to-run retrain command (on ALL train speakers) with the winner.
+    # Ready-to-run retrain command with the winner. SSC's valid is a separate
+    # split (no val->train merge): run_scc.py trains on train and reports test.
     bp = study.best_params
     cs = int(bp["channel_shift_range"])
     chan_shift_flag = (
         f"--augment_channel_shift --channel_shift_range {cs} " if cs > 0 else ""
     )
     print(
-        "\nRetrain the winner on ALL speakers, then report test:\n"
-        f"  python BPTT_fix/run_shd.py --hidden {hidden_str.replace('-', ' ')} "
+        "\nRetrain the winner, then report test:\n"
+        f"  python BPTT_fix/run_scc.py --hidden {hidden_str.replace('-', ' ')} "
         f"--n_outputs {args.n_outputs} "
         f"--optimizer {args.optimizer} --precision {args.precision} "
         f"--batch_size {args.batch_size} --epochs {args.epochs} "
-        f"--bin_size_ms {args.bin_size_ms} --collapse_factor {args.collapse_factor} "
-        f"--max_duration_ms {args.max_duration_ms} "
+        f"--eval_split test "
         f"--lr {bp['lr']:.6g} --weight_scale {bp['weight_scale']:.4g} "
         f"--loss_temperature {bp['loss_temperature']:.4g} "
         f"--loss_count_bias {bp['loss_count_bias']:.4g} "
