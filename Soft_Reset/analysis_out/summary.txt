@@ -34,8 +34,8 @@ MODEL: shd_seed12_20260910_122249.npz
 [3]  Mean readout + hidden firing rate ...
   Mean hidden firing rate (test): 0.1443 (spikes per neuron per timestep)
     per-neuron rate: min=0.0114  median=0.1418  max=0.3146  dead(<1e-4)=0/512
-  Example test sample #1779: true=fünf  pred=fünf  p(true)=0.486
-  Mean readout voltage (this example): true-class=0.713  argmax=0.713  mean|logit|=6.666
+  Example test sample #1667: true=6 six  pred=6 six  p(true)=0.804
+  Mean readout voltage (this example): true-class=-1.401  argmax=-1.401  mean|logit|=12.479
   -> /net/home/staff/t/tibax/Dokumente/Dendro/Soft_Reset/analysis_out/readout_and_firing_rate.png
 
 [4]  Spike probability inside vs outside a plateau ...
@@ -53,5 +53,5 @@ MODEL: shd_seed12_20260910_122249.npz
   -> /net/home/staff/t/tibax/Dokumente/Dendro/Soft_Reset/analysis_out/plateau_gain_modulation.png
 
 [5]  Forward/backward traces for 4 random hidden neurons ...
-  Example test sample #1779 (true=fünf, pred=fünf); neurons=[61, 208, 227, 285]
+  Example test sample #1667 (true=6 six, pred=6 six); neurons=[52, 140, 179, 466]
   -> /net/home/staff/t/tibax/Dokumente/Dendro/Soft_Reset/analysis_out/neuron_forward_backward_traces.png
