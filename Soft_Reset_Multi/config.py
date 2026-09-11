@@ -27,13 +27,17 @@ class NeuronConfig:
     b_adapt: float = 0.0          # spike-triggered jump; 0.0 = off
 
     # ── Surrogate gradient sharpness (see surrogate_sigma) ──
+    # NOTE (autograd variant): these are all HONORED, wired to reproduce
+    # Soft_Reset's e-prop gradient via the two-path `somatic_spike` custom_vjp in
+    # network.py — the soma edge uses beta_s, the dendritic edge uses beta_s_dend
+    # (+ the roof when dend_surrogate_roof is set), and the plateau uses beta_d.
     beta_s: float = 1.0           # somatic surrogate, somatic gradient path
-    beta_s_dend: float = 1.0      # somatic surrogate as it enters the dendritic path
+    beta_s_dend: float = 1.0      # somatic surrogate on the DENDRITIC gradient edge
     beta_d: float = 1.5           # dendritic
 
-    # Dendritic-path somatic surrogate: False = single bump (surrogate_sigma at the
-    # dynamic threshold), True = flat "roof" over [v_th-gamma, v_th]. Static so it
-    # can drive a Python `if` at trace time under jit/lax.scan.
+    # HONORED in the autograd variant: switches the dendritic gradient edge (∂o/∂h)
+    # to the flat "roof" over [v_th-gamma, v_th] (surrogate_roof, gamma folded into
+    # the width) instead of the single bump. Same effect as in Soft_Reset.
     dend_surrogate_roof: bool = struct.field(pytree_node=False, default=False)
 
     # ── Init and loss ──

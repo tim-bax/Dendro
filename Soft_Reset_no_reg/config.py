@@ -42,13 +42,6 @@ class NeuronConfig:
     loss_count_bias: float = 0.18
     loss_label_smoothing: float = 0.13
 
-    # ── Firing-rate regularization (disabled by default) ──
-    # Hinge-L2 penalty L_reg = (strength/2) Σ_n max(0, r_n - target)² on the
-    # per-neuron mean spike rate r_n. Only ABOVE-target firing is penalized, so
-    # quiet neurons are untouched. 0.0 = off.
-    rate_reg_strength: float = 0.0
-    rate_target: float = 0.05     # target mean rate (spikes/step); ~0.05 ≈ 12.5 Hz at dt=4ms
-
     v_reset: float = 0.0          # unused: soft reset subtracts v_th_eff (v - o*v_th_eff)
 
 

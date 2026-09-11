@@ -80,7 +80,10 @@ def parse_args():
                    help="Sum-pool every N consecutive input channels (paper default 5: 700 -> 140).")
     p.add_argument("--max_duration_ms", type=float, default=1400.0,
                    help="Fixed window length in ms (paper default 1400). Sets T = ceil(max_duration_ms / bin_size_ms).")
-    p.add_argument("--n_hidden", type=int, default=64)
+    p.add_argument("--n_hidden", type=int, nargs="+", default=[64],
+                   help="Hidden layer widths, one int per layer. "
+                        "e.g. --n_hidden 128 64 32 builds a 3-layer stack "
+                        "(default: [64], a single layer).")
     p.add_argument("--n_outputs", type=int, default=20)
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--seed", type=int, default=42)
@@ -311,7 +314,8 @@ def main():
     if args.rate_reg_strength > 0:
         reg_str = (f"  rate_reg=λ{args.rate_reg_strength}"
                    f"(target={args.rate_target})")
-    arch_str = f"{n_inputs} -> {args.n_hidden} (2-comp) -> {args.n_outputs} (LI readout)"
+    hidden_str = " -> ".join(str(h) for h in args.n_hidden)
+    arch_str = f"{n_inputs} -> {hidden_str} (2-comp) -> {args.n_outputs} (LI readout)"
     print(
         f"Network: {arch_str}  "
         f"optimizer={opt_str}  lr={args.lr}{drop_str}{chan_shift_str}{wd_str}{reg_str}",

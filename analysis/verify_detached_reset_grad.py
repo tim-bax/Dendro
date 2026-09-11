@@ -240,6 +240,18 @@ def main():
     w_dend, w_soma, w_readout = net._weights()
     alpha_s, alpha_d, alpha_m, T_p, config, alpha_w = net._params()
 
+    # The replica models only the single-bump dend surrogate (via the
+    # h -> v_th_eff -> o chain, using beta_s). Guard the regime where that
+    # reproduces network.py's actual dend gradient, so the dend rows can never
+    # silently misreport.
+    if config.dend_surrogate_roof:
+        print("WARNING: dend_surrogate_roof=True — the replica models only the "
+              "single-bump dend surrogate; the dend rows below are NOT comparable. "
+              "readout/soma/loss rows remain valid.")
+    if config.beta_s != config.beta_s_dend:
+        print(f"NOTE: beta_s ({config.beta_s}) != beta_s_dend "
+              f"({config.beta_s_dend}); dend rows use beta_s in the replica.")
+
     # Pick the most dendritically active sample so the dend comparison is real.
     N = min(args.scan_samples, X_te.shape[0])
     xs = jnp.asarray(X_te[:N])
@@ -264,6 +276,7 @@ def main():
         alpha_s, alpha_d, alpha_m, T_p, config, alpha_w,
         target_smoothed, config.loss_temperature, config.loss_count_bias,
         random.PRNGKey(0), 0.0,
+        0.0, 0.0,                      # rate_reg_strength, rate_target  (reg OFF)
     )
 
     # global_error is the cotangent the hand-coded path contracts A_* with.

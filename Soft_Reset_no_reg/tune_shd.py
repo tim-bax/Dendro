@@ -3,8 +3,7 @@
 
 Refit around a strong 512-hidden ROOF-surrogate recipe: the whole biophysics /
 regularization recipe is FROZEN to that run's values (passed on the CLI) and only
-SIX knobs are optimized on the macro-averaged (per-class) held-out-SPEAKER
-VALIDATION accuracy:
+SIX knobs are optimized on the held-out-SPEAKER VALIDATION accuracy:
 
   lr, loss_temperature, loss_label_smoothing, gamma,
   channel_shift_range, tau_plat_max
@@ -17,11 +16,8 @@ it must be enabled to match the target run). ``loss_count_bias`` is FROZEN to 0.
 searched.
 
 SHD ships no validation split, so some train SPEAKERS are held out as val (the SHD
-*test* set is never touched during the search). The default holdout is ``[9, 10]``
-— a male (spk9, age 32) + female (spk10, age 25) pair chosen to mirror the SHD
-*test* set's two novel speakers (spk4 male/31, spk5 female/27), so the val
-speaker-generalization gap tracks test. Retrain the winner on ALL train speakers
-with run_shd.py (no held-out speakers) before reporting test.
+*test* set is never touched during the search). Retrain the winner on ALL train
+speakers with run_shd.py (no held-out speakers) before reporting test.
 
     python Soft_Reset/tune_shd.py --precision 32 --n_trials 200 --n_hidden 512 \
       --dend_surrogate_roof --storage sqlite:///Soft_Reset/soft_reset_shd_512.db
@@ -40,7 +36,6 @@ import json
 import os
 import sys
 import time
-from collections import defaultdict
 
 import jax
 
@@ -124,36 +119,24 @@ def build_pruner(args):
 
 
 def evaluate(net, dataset, batch_size=64):
-    """Macro-averaged (mean per-class) top-1 accuracy (%) over a dataset.
-
-    Averages per-class recall over the classes present, so an imbalanced val set
-    (the speaker holdout leans English) weights every digit equally and a weak
-    class such as ``neun`` can't be masked by the majority. Batched with
-    last-batch padding.
-    """
+    """Top-1 accuracy (%) over a dataset, batched with last-batch padding."""
     n = len(dataset)
     if n == 0:
         return 0.0
-    correct = defaultdict(int)
-    total = defaultdict(int)
     if batch_size <= 1:
-        for x, y in dataset:
-            yc = int(y)
-            total[yc] += 1
-            correct[yc] += int(net.predict(x) == yc)
-    else:
-        for start in range(0, n, batch_size):
-            batch = dataset[start:start + batch_size]
-            actual = len(batch)
-            xs = [x for x, y in batch]
-            ys = [int(y) for x, y in batch]
-            if actual < batch_size:
-                xs += [xs[0]] * (batch_size - actual)
-            preds = np.asarray(net.batch_predict(jnp.stack(xs)))
-            for i in range(actual):
-                total[ys[i]] += 1
-                correct[ys[i]] += int(int(preds[i]) == ys[i])
-    return 100.0 * sum(correct[c] / total[c] for c in total) / len(total)
+        correct = sum(1 for x, y in dataset if net.predict(x) == int(y))
+        return 100.0 * correct / n
+    correct = 0
+    for start in range(0, n, batch_size):
+        batch = dataset[start:start + batch_size]
+        actual = len(batch)
+        xs = [x for x, y in batch]
+        ys = jnp.array([int(y) for x, y in batch])
+        if actual < batch_size:
+            xs += [xs[0]] * (batch_size - actual)
+        preds = net.batch_predict(jnp.stack(xs))
+        correct += int(jnp.sum(preds[:actual] == ys))
+    return 100.0 * correct / n
 
 
 def parse_args():
@@ -165,10 +148,8 @@ def parse_args():
     p.add_argument("--epochs", type=int, default=60,
                    help="Per-trial epoch budget. Trials run to the full count "
                         "unless truncated by the (light) MedianPruner.")
-    p.add_argument("--val_speakers", type=int, nargs="+", default=[9, 10],
-                   help="Speaker ids held out of train as the val set (>=1). Default "
-                        "[9, 10] (male spk9/32 + female spk10/25) mirrors the SHD test "
-                        "set's novel speakers (spk4 male/31, spk5 female/27).")
+    p.add_argument("--val_speakers", type=int, nargs="+", default=[3, 7],
+                   help="Speaker ids held out of train as the val set (>=1).")
     p.add_argument("--progress_every", type=int, default=5,
                    help="Print a per-trial heartbeat every N epochs (0 = off).")
     p.add_argument("--storage", type=str, default="",
@@ -353,11 +334,6 @@ def main():
         f"(val N={len(val_data)}, train N={len(train_data)})  "
         f"trials={args.n_trials}  epochs/trial={args.epochs}  "
         f"opt={args.optimizer}  bs={args.batch_size}  pruner={args.pruner}",
-        flush=True,
-    )
-    print(
-        "Objective: macro-averaged (mean per-class) val top-1 accuracy "
-        "(equal weight per digit).",
         flush=True,
     )
     print(

@@ -279,7 +279,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("model", nargs="?",
-                    default=os.path.join(_SCRIPT_DIR, "models", "shd_seed12_20260910_122249.npz"), #shd_seed12_20260909_150601.npz
+                    default=os.path.join(_SCRIPT_DIR, "models",
+                                         "shd_seed12_20260909_150601.npz"),
                     help="Path to the .npz model.")
     ap.add_argument("--outdir", default=os.path.join(_SCRIPT_DIR, "analysis_out"))
     ap.add_argument("--seed", type=int, default=0,

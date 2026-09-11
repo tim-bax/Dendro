@@ -51,9 +51,7 @@ if _ROOT not in sys.path:
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
-from data.shd_binned_jitter import (
-    load_shd_binned, apply_channel_shift, apply_time_jitter,
-)
+from data.shd_binned import load_shd_binned, apply_channel_shift
 from config import NeuronConfig
 from network import Network
 
@@ -62,8 +60,6 @@ def augment_sample(x, args):
     """Apply enabled training-time augmentations to one sample (training only)."""
     if args.augment_channel_shift:
         x = apply_channel_shift(x, args.channel_shift_range)
-    if args.augment_time_jitter:
-        x = apply_time_jitter(x, args.time_jitter_steps)
     return x
 
 
@@ -89,14 +85,6 @@ def parse_args():
     p.add_argument("--loss_temperature", type=float, default=2.7)
     p.add_argument("--loss_count_bias", type=float, default=0.18)
     p.add_argument("--loss_label_smoothing", type=float, default=0.13)
-    p.add_argument("--rate_reg_strength", type=float, default=0.0,
-                   help="Firing-rate penalty weight λ for the hinge-L2 rate "
-                        "regularizer (0.0 = off). Only above-target firing is "
-                        "penalized. Start small (e.g. 1-30) and raise until the "
-                        "mean hidden rate approaches --rate_target.")
-    p.add_argument("--rate_target", type=float, default=0.05,
-                   help="Target per-neuron mean firing rate (spikes/step) for the "
-                        "rate regularizer; ~0.05 ≈ 12.5 Hz at dt=4ms.")
     p.add_argument("--beta_s", type=float, default=1.0)
     p.add_argument("--beta_s_dend", type=float, default=None,
                    help="Somatic-surrogate sharpness used in the DENDRITIC gradient "
@@ -143,19 +131,6 @@ def parse_args():
         default=5,
         help="Channel-shift range in channels (uniform in [-range, +range]); "
              "operates on the collapsed channel axis.",
-    )
-    p.add_argument(
-        "--augment_time_jitter",
-        action="store_true",
-        help="Enable temporal-jitter augmentation on training inputs only "
-             "(time-axis analogue of channel shift; composes with it).",
-    )
-    p.add_argument(
-        "--time_jitter_steps",
-        type=int,
-        default=5,
-        help="Time-jitter range in time bins (uniform in [-steps, +steps]); "
-             "physical ms = steps * bin_size_ms (5 bins = ±20ms at 4ms).",
     )
     p.add_argument("--weight_decay", type=float, default=0.0,
                    help="Decoupled weight decay (AdamW-style for Adam, "
@@ -272,8 +247,6 @@ def main():
         loss_temperature=args.loss_temperature,
         loss_count_bias=args.loss_count_bias,
         loss_label_smoothing=args.loss_label_smoothing,
-        rate_reg_strength=args.rate_reg_strength,
-        rate_target=args.rate_target,
     )
     alpha_s = float(np.exp(-config.dt / config.tau_soma))
     alpha_m = float(np.exp(-config.dt / config.tau_m))
@@ -304,17 +277,11 @@ def main():
     chan_shift_str = ""
     if args.augment_channel_shift:
         chan_shift_str = f"  augment_channel_shift=True(range=±{args.channel_shift_range})"
-    if args.augment_time_jitter:
-        chan_shift_str += f"  augment_time_jitter=True(±{args.time_jitter_steps} bins)"
     wd_str = f"  weight_decay={args.weight_decay}" if args.weight_decay > 0 else ""
-    reg_str = ""
-    if args.rate_reg_strength > 0:
-        reg_str = (f"  rate_reg=λ{args.rate_reg_strength}"
-                   f"(target={args.rate_target})")
     arch_str = f"{n_inputs} -> {args.n_hidden} (2-comp) -> {args.n_outputs} (LI readout)"
     print(
         f"Network: {arch_str}  "
-        f"optimizer={opt_str}  lr={args.lr}{drop_str}{chan_shift_str}{wd_str}{reg_str}",
+        f"optimizer={opt_str}  lr={args.lr}{drop_str}{chan_shift_str}{wd_str}",
         flush=True,
     )
 

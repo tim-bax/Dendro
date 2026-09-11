@@ -31,24 +31,14 @@ def _forward_backward(
     x_input, w_dend, w_soma, w_readout,
     alpha_s, alpha_d, alpha_m, T_p, config, alpha_w,
     target_smoothed, loss_temperature, loss_count_bias,
-    rng_key, dropout_rate, rate_reg_strength, rate_target,
+    rng_key, dropout_rate,
 ):
     """Two-pass, error-projected e-prop for one sample. Loss + all weight grads.
 
-    x_input:          (T, K)  input spike train
-    target_smoothed:  (J,)    label-smoothed one-hot target
-    rng_key:          PRNG key for dropout masks
-    dropout_rate:     fraction of hidden spikes to drop (0.0 = no dropout)
-    rate_reg_strength: firing-rate penalty weight λ (0.0 = off)
-    rate_target:      target per-neuron mean rate for the hinge penalty
-
-    Firing-rate regularization: a hinge-L2 penalty L_reg = (λ/2) Σ_n
-    max(0, r_n - rate_target)² on each hidden neuron's mean rate r_n. Its ascent
-    gradient is exactly the existing e-prop accumulation with an extra per-neuron
-    learning signal reg_n = -(λ/T)·max(0, r_n - rate_target) folded into `delta`,
-    so it flows through BOTH compartments (soma via sp_hidden, dendrite via
-    sp_hidden_d·hp_hidden) with the same surrogate the task uses. r_n is measured
-    in pass 1, so reg_n is a constant by pass 2.
+    x_input:        (T, K)  input spike train
+    target_smoothed: (J,)   label-smoothed one-hot target
+    rng_key:        PRNG key for dropout masks
+    dropout_rate:   fraction of hidden spikes to drop (0.0 = no dropout)
 
     Returns: mean_voltage (J,), loss, prediction,
              grad_readout (J,N), grad_soma (N,K), grad_dend (N,K).
@@ -91,39 +81,28 @@ def _forward_backward(
             jnp.zeros(n_hidden),                   # w (adaptation)
         )
 
-    # ── Pass 1: forward with dropout → mean voltage + Σ_t E_readout + Σ_t o ──
+    # ── Pass 1: forward with dropout → mean voltage + Σ_t E_readout ─────────
     def step1(carry, inputs):
-        h_carry, r_carry, sum_Er, sum_o = carry
+        h_carry, r_carry, sum_Er = carry
         dend_in, soma_in, t, drop_key = inputs
 
         h_carry, h_o, *_ = TwoCompNeuron.forward_step(
             h_carry, dend_in, soma_in, t, alpha_s, alpha_d, T_p, config, alpha_w,
         )
-        # Raw (pre-dropout) hidden spikes for the firing-rate penalty. The hidden
-        # train is dropout-independent — dropout only masks what the readout sees.
-        sum_o = sum_o + h_o.astype(jnp.float64)
         # Dropout: zero hidden spikes before the readout, scale survivors by
         # 1/(1-p). At dropout_rate=0.0 the mask is all-ones and scale is 1.0.
         mask = random.bernoulli(drop_key, 1.0 - dropout_rate, (n_hidden,)).astype(jnp.float64)
         hidden_o = h_o.astype(jnp.float64) * mask * dropout_scale
 
         r_carry, _, r_E = LINeuron.forward_step(r_carry, hidden_o, w_readout, alpha_m)
-        return (h_carry, r_carry, sum_Er + r_E, sum_o), None
+        return (h_carry, r_carry, sum_Er + r_E), None
 
     r_init = (jnp.zeros(n_outputs), jnp.zeros(n_outputs), jnp.zeros(n_hidden))
     scan_inputs1 = (dend_inputs, soma_inputs, time_indices, dropout_keys)
-    (_, r_carry_f, sum_Er, sum_o), _ = lax.scan(
-        step1, (_hidden_zeros(), r_init, jnp.zeros(n_hidden), jnp.zeros(n_hidden)),
-        scan_inputs1,
+    (_, r_carry_f, sum_Er), _ = lax.scan(
+        step1, (_hidden_zeros(), r_init, jnp.zeros(n_hidden)), scan_inputs1,
     )
     mean_voltage = r_carry_f[1] / T  # sum_v / T
-
-    # Per-neuron firing-rate penalty as a constant learning signal (N,), folded
-    # into `delta` in pass 2. reg_n < 0 where a neuron fires above target ⇒ it
-    # subtracts from the ascent update, suppressing that neuron's drive. The 1/T
-    # is ∂r_n/∂w's normalization (r_n = Σ_t o / T); the Σ_t sp·E happens in pass 2.
-    rate_n = sum_o / T                                              # (N,)
-    reg_n = -(rate_reg_strength / T) * jnp.maximum(rate_n - rate_target, 0.0)
 
     # ── Loss, error signal, exact readout grad, projected learning signal ──
     scaled_logits = mean_voltage / loss_temperature + loss_count_bias
@@ -170,9 +149,8 @@ def _forward_backward(
 
         # delta = rho[t]·(w_readout^T e): the readout-filtered learning signal,
         # length N. The old rule's per-j tensor collapses to this vector because
-        # the readout is linear (sp_readout == 1). reg_n (constant over t) adds the
-        # firing-rate penalty's learning signal, so it rides both compartments.
-        delta = rho_t * readout_seed + reg_n                          # (N,)
+        # the readout is linear (sp_readout == 1).
+        delta = rho_t * readout_seed                                  # (N,)
         grad_soma = grad_soma + (delta * sp_hidden)[:, None] * E_soma_new[None, :]
 
         if config.dend_surrogate_roof:
@@ -312,7 +290,6 @@ _FB_AXES = (
     None, None,                      # loss_temperature, loss_count_bias
     0,                               # rng_key (per-sample)
     None,                            # dropout_rate (shared)
-    None, None,                      # rate_reg_strength, rate_target (shared)
 )
 
 _PRED_AXES = (
@@ -481,7 +458,6 @@ class Network:
             self._smooth_targets(target),
             self.config.loss_temperature, self.config.loss_count_bias,
             self._next_key(), self.dropout_rate,
-            self.config.rate_reg_strength, self.config.rate_target,
         )
 
         gnorms = {
@@ -513,7 +489,6 @@ class Network:
             self._smooth_targets(targets),
             self.config.loss_temperature, self.config.loss_count_bias,
             batch_keys, self.dropout_rate,
-            self.config.rate_reg_strength, self.config.rate_target,
         )
 
         g_r_avg = jnp.mean(g_r, axis=0)
